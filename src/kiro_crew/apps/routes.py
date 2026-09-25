@@ -32,6 +32,10 @@ from aiohttp import web
 from kiro_crew import platform_compat
 from kiro_crew.apps import official_catalog
 from kiro_crew.apps.backend import (
+    PidfileDeleteFailed,
+    _restore_app_pid,
+    capture_backend_provenance,
+    forget_backend_provenance,
     get_app_backend_port,
     list_app_processes,
     recorded_backend_port,
@@ -688,11 +692,47 @@ async def _stop_backend_and_observe(name: str) -> tuple[int | None, bool]:
     """
     loop = asyncio.get_running_loop()
     port_hint = await loop.run_in_executor(subprocess_executor(), recorded_backend_port, name)
-    await loop.run_in_executor(subprocess_executor(), stop_app_backend, name)
+    # The spawn-provenance row has ALREADY been dropped by the uninstall's Step-1b
+    # preflight (a confirmed delete that aborts the whole uninstall on failure), so
+    # this stop takes the PLAIN path and does not touch provenance again. Doing the
+    # delete here instead would make it non-terminal — onUninstall has already run by
+    # now, so a failed delete could not abort — which is exactly the hazard the
+    # preflight exists to remove.
+    await loop.run_in_executor(subprocess_executor(), lambda: stop_app_backend(name))
     live_port = await loop.run_in_executor(
         subprocess_executor(), lambda: unstopped_backend_port(name, port_hint=port_hint)
     )
     return live_port, port_hint is not None
+
+
+async def _invalidate_provenance_before_restart(name: str) -> bool:
+    """Drop the pre-update spawn record and report whether it is confirmed gone.
+
+    An update replaces the code behind the name while reusing the port, so the
+    pre-update row still vouches for whatever rebinds it and a restart would adopt a
+    survivor running the OLD code as the new version. Called once the update has
+    committed (the rollback path has already returned), this invalidates the stale
+    row so the new spawn records its own.
+
+    Returns ``True`` when the drop is CONFIRMED on disk and the caller may restart.
+    Returns ``False`` when the write could not be confirmed (ENOSPC/EDQUOT: the row
+    stays on disk) — the caller must then NOT restart, or it would adopt the
+    stale-row survivor; the files are updated regardless and the operator restarts
+    once the disk is writable.
+    """
+    try:
+        await asyncio.get_running_loop().run_in_executor(
+            subprocess_executor(), forget_backend_provenance, name
+        )
+        return True
+    except PidfileDeleteFailed as exc:
+        logger.warning(
+            "update of %r: could not invalidate the spawn record (%s); not starting "
+            "the backend, so no old-code survivor is adopted as the new version",
+            name,
+            exc,
+        )
+        return False
 
 
 async def _app_may_run_after_install(name: str, *, fresh_install: bool = False) -> bool:
@@ -707,7 +747,9 @@ async def _app_may_run_after_install(name: str, *, fresh_install: bool = False) 
     return await asyncio.get_running_loop().run_in_executor(subprocess_executor(), _read_live_state)
 
 
-async def _restore_app_after_failed_update(name: str) -> None:
+async def _restore_app_after_failed_update(
+    name: str, preserved_row: dict[str, Any] | None = None
+) -> None:
     """Put an app back the way a failed update found it.
 
     The update stopped the backend and scrubbed the resources before it touched
@@ -718,9 +760,20 @@ async def _restore_app_after_failed_update(name: str) -> None:
     unconditional re-register would publish a disabled app's agents, skills,
     MCP servers and crons, and nothing scrubs them again until the next
     enable/disable. Live read: a failed update leaves the record unchanged.
+
+    *preserved_row* is the spawn record captured BEFORE the update's stop. The stop
+    forgets a tracked backend's row, so without this the rollback restart's adopt
+    branch would re-capture a surviving detached child, find no record attributing
+    it, and refuse it -- leaving the enabled app unreachable. Restored BEFORE the
+    restart (idempotent setdefault via _restore_app_pid: a fresh spawn that recorded
+    its own identity meanwhile wins) so the survivor is attributable again.
     """
     if not await _app_may_run_after_install(name):
         return
+    if preserved_row is not None:
+        await asyncio.get_running_loop().run_in_executor(
+            subprocess_executor(), _restore_app_pid, name, preserved_row
+        )
     await _register_app_off_loop(name)
     await asyncio.get_running_loop().run_in_executor(subprocess_executor(), start_app_backend, name)
 
@@ -939,6 +992,11 @@ async def handle_update_app(request: web.Request) -> web.Response:
             # uninstall and the disable rollback. Stopping pops the tracking record,
             # so the health watch cannot re-register the OLD manifest's MCP servers
             # after the scrub (see app-kit-platform §17).
+            # Capture the spawn row BEFORE the stop forgets it, so a failed update
+            # can restore it and the rollback restart can re-attribute a survivor.
+            reg_preserved_row = await asyncio.get_running_loop().run_in_executor(
+                subprocess_executor(), capture_backend_provenance, name
+            )
             await asyncio.get_running_loop().run_in_executor(
                 subprocess_executor(), stop_app_backend, name
             )
@@ -946,7 +1004,7 @@ async def handle_update_app(request: web.Request) -> web.Response:
 
             reg_install = await install_from_registry(registry_name)
             if not reg_install.get("ok"):
-                await _restore_app_after_failed_update(name)
+                await _restore_app_after_failed_update(name, reg_preserved_row)
                 sel().log_api_access(
                     caller="dashboard",
                     operation="app_update",
@@ -955,18 +1013,33 @@ async def handle_update_app(request: web.Request) -> web.Response:
                     error=reg_install.get("error", ""),
                 )
                 return web.json_response(reg_install, status=400)
+            # The update committed. Drop the pre-update spawn record BEFORE any
+            # restart (see _invalidate_provenance_before_restart): a retained row
+            # would let the restart adopt an old-code survivor as the new version.
+            # An unconfirmed drop means do NOT restart — but the app is UPDATED and
+            # must still be re-registered so it is not left with zero resources.
+            reg_provenance_dropped = await _invalidate_provenance_before_restart(name)
             # Live read, not the pre-update ``info`` snapshot: ``update_app`` drops
             # ``enabled`` when the new version adds ``permissions.sessionApproval``,
             # and a backend started here would run an app the UI shows as disabled.
+            # Re-registration is NOT gated on the provenance drop (persist-before-you-
+            # publish: a successful update must not leave the app deregistered); only
+            # the RESTART is, so a retained row cannot be adopted as the new version.
             still_enabled = await _app_may_run_after_install(name)
             if still_enabled:
                 reg_result = await _register_app_off_loop(name)
-                await asyncio.get_running_loop().run_in_executor(
-                    subprocess_executor(), start_app_backend, name
-                )
                 reg_install["registration"] = reg_result.to_dict()
+                if reg_provenance_dropped:
+                    await asyncio.get_running_loop().run_in_executor(
+                        subprocess_executor(), start_app_backend, name
+                    )
+        # The skipped restart is recorded by the SEL outcome below
+        # (completed_without_restart) and the gateway log; it is not echoed in the
+        # response because no dashboard consumer reads a `warnings` field on update
+        # (the update UI renders only `?.notice`).
+        reg_outcome = "completed" if reg_provenance_dropped else "completed_without_restart"
         sel().log_api_access(
-            caller="dashboard", operation="app_update", outcome="completed", resources=name
+            caller="dashboard", operation="app_update", outcome=reg_outcome, resources=name
         )
         return web.json_response(reg_install)
 
@@ -990,6 +1063,11 @@ async def handle_update_app(request: web.Request) -> web.Response:
         # the disable rollback. Stopping pops the tracking record, so the health watch
         # cannot re-register the OLD manifest's MCP servers after the scrub
         # (see app-kit-platform §17).
+        # Capture the spawn row BEFORE the stop forgets it, so a failed update can
+        # restore it and the rollback restart can re-attribute a survivor.
+        preserved_row = await asyncio.get_running_loop().run_in_executor(
+            subprocess_executor(), capture_backend_provenance, name
+        )
         await asyncio.get_running_loop().run_in_executor(
             subprocess_executor(), stop_app_backend, name
         )
@@ -1002,7 +1080,7 @@ async def handle_update_app(request: web.Request) -> web.Response:
             subprocess_executor(), lambda: update_app(source, expected_name=name)
         )
         if not up_result.ok:
-            await _restore_app_after_failed_update(name)
+            await _restore_app_after_failed_update(name, preserved_row)
             sel().log_api_access(
                 caller="dashboard",
                 operation="app_update",
@@ -1012,24 +1090,41 @@ async def handle_update_app(request: web.Request) -> web.Response:
             )
             return web.json_response(up_result.to_dict(), status=400)
 
-        # Re-register with the new manifest only if the app is STILL enabled.
-        # ``update_app`` drops ``enabled`` when the new version adds
-        # ``permissions.sessionApproval``, so the pre-update ``info`` snapshot
-        # would start a backend the user has not re-consented to.
+        # The update committed. Drop the pre-update spawn record BEFORE any restart
+        # (see _invalidate_provenance_before_restart): a retained row would let the
+        # restart adopt an old-code survivor as the new version. An unconfirmed drop
+        # means do NOT restart — but the app is still UPDATED and must be re-registered
+        # so it does not sit with zero agents/skills/crons after a successful update.
         up_reg = None
+        provenance_dropped = await _invalidate_provenance_before_restart(name)
+
+        # Re-register with the new manifest if the app is STILL enabled (``update_app``
+        # drops ``enabled`` when the new version adds ``permissions.sessionApproval``,
+        # so the pre-update ``info`` snapshot would start a backend the user has not
+        # re-consented to). Re-registration is NOT gated on the provenance drop: the
+        # files are already updated, so skipping it would leave the updated app
+        # deregistered while the endpoint reports success (persist-before-you-publish).
+        # Only the RESTART is gated on the confirmed drop — restarting on a retained
+        # row would adopt the old-code survivor the stale row still vouches for.
         still_enabled = await _app_may_run_after_install(name)
         if still_enabled:
             up_reg = await _register_app_off_loop(name)
-            await asyncio.get_running_loop().run_in_executor(
-                subprocess_executor(), start_app_backend, name
-            )
+            if provenance_dropped:
+                await asyncio.get_running_loop().run_in_executor(
+                    subprocess_executor(), start_app_backend, name
+                )
 
+    outcome = "completed" if provenance_dropped else "completed_without_restart"
     sel().log_api_access(
-        caller="dashboard", operation="app_update", outcome="completed", resources=name
+        caller="dashboard", operation="app_update", outcome=outcome, resources=name
     )
     resp: dict[str, Any] = up_result.to_dict()
     if up_reg:
         resp["registration"] = up_reg.to_dict()
+    # The skipped restart is recorded by the SEL outcome (completed_without_restart)
+    # and the gateway log; it is not echoed in the response because no dashboard
+    # consumer reads a `warnings` field on update (the update UI renders only
+    # `?.notice`).
     return web.json_response(resp)
 
 
@@ -1421,6 +1516,9 @@ async def handle_uninstall_app(request: web.Request) -> web.Response:
                     resources=f"app={name}",
                     error=f"cron cleanup failed, uninstall aborted: {exc}",
                 )
+                # Nothing destructive has run yet (no delete, no onUninstall, no file
+                # removal), so the "app is still installed; retry" message is literally
+                # true and the retry is safe.
                 return web.json_response(
                     {
                         "error": (
@@ -1458,6 +1556,7 @@ async def handle_uninstall_app(request: web.Request) -> web.Response:
                     resources=f"app={name}",
                     error=f"cron store unreadable, uninstall aborted: {exc}",
                 )
+                # Nothing destructive has run yet, so retrying is safe.
                 return web.json_response(
                     {
                         "error": str(exc),
@@ -1496,6 +1595,7 @@ async def handle_uninstall_app(request: web.Request) -> web.Response:
                     resources=f"app={name}",
                     error=f"cron cleanup failed, uninstall aborted: {exc}",
                 )
+                # Nothing destructive has run yet, so retrying is safe.
                 return web.json_response(
                     {
                         "error": (
@@ -1652,6 +1752,27 @@ async def handle_uninstall_app(request: web.Request) -> web.Response:
             result = await asyncio.get_running_loop().run_in_executor(
                 subprocess_executor(), lambda: uninstall_app(name, keep_data=keep_data)
             )
+        if result.ok:
+            # Delete the spawn-provenance record ONLY now, at the uninstall's durable
+            # commit boundary — the files are removed, so the app is gone. Doing it
+            # here (not up front) is what makes it crash-safe: there is no window where
+            # the row is gone while the app still exists, so a gateway kill or task
+            # cancellation at any earlier step leaves the row intact and the next-boot
+            # stale-reap handles the orphaned backend normally. A failed delete here is
+            # logged, not aborted — the app is already removed, so there is nothing to
+            # roll back; the stale row waits for the next-boot reap to clear it.
+            try:
+                await asyncio.get_running_loop().run_in_executor(
+                    subprocess_executor(), forget_backend_provenance, name
+                )
+            except PidfileDeleteFailed as exc:
+                logger.warning(
+                    "uninstall of %s: files removed but the spawn-record delete could "
+                    "not be confirmed (%s); the stale row stays on disk until the "
+                    "next-boot reap clears it",
+                    name,
+                    exc,
+                )
 
         # Step 6: drop the resume pointer of every conversation the app owned.
         #
@@ -1789,6 +1910,10 @@ async def handle_uninstall_app(request: web.Request) -> web.Response:
                         await asyncio.to_thread(shutil.rmtree, ws_dir, ignore_errors=True)
                         uninstall_log.append(f"Removed workspace for {app_reg_name}")
     if not result.ok:
+        # Step 5 (uninstall_app) failed and restored the app's files, so the app is
+        # still installed. The spawn-provenance record was never touched — it is
+        # deleted only at the commit boundary above, on result.ok — so there is
+        # nothing to restore: the still-installed app keeps attributing its backend.
         sel().log_api_access(
             caller="dashboard",
             operation="app_uninstall",

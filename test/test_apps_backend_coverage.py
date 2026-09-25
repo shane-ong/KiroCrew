@@ -1239,6 +1239,15 @@ class TestAdoptExistingInstance:
         # installed.json; in production start_app_backend only ever runs for an enabled
         # app. The gate itself is pinned by TestPromotionRequiresAConfirmedEnabledApp.
         monkeypatch.setattr(bmod, "_app_enabled_state", lambda name: True)
+        # Adoption is gated on provenance: only a listener the gateway can attribute
+        # to the spawn it recorded for this app is adopted. Every case below is about
+        # WHICH owners get recorded, so the record is present here and vouches the
+        # listener whatever pid the case stubs. The verdict matrix has its own class.
+        bmod._write_pidfile(
+            {"adoptee": {"pid": 0, "start_time": None, "port": 0, "spawn_instance": "sp-adoptee"}}
+        )
+        monkeypatch.setattr(bmod, "group_vouching_available", lambda: True)
+        monkeypatch.setattr(bmod, "_env_spawn_instance", lambda _pid: "sp-adoptee")
         return spawn_root
 
     def _run(self, port: int) -> AppProcess | None:
@@ -1428,6 +1437,544 @@ class TestAdoptExistingInstance:
     ) -> None:
         monkeypatch.setattr(bmod, "loopback_urlopen", lambda *_a, **_k: _FakeResp(503))
         assert self._run(bmod._MIN_PORT + 11) is None
+
+
+# ---------------------------------------------------------------------------
+# Spawn body: adoption provenance
+# ---------------------------------------------------------------------------
+
+
+class TestAdoptionProvenance:
+    """One verdict per identity case the adoption branch can meet.
+
+    A health answer on the manifest's declared port names no code and no
+    process, so on its own it lets a backend that outlived its app's uninstall
+    be adopted by the next install that happens to use the same app name. The
+    gateway adopts only what it can attribute to the spawn it recorded for that
+    app, by the recorded leader's identity or by the spawn instance its whole
+    tree carries, and refuses everything else.
+    """
+
+    @staticmethod
+    def _row(**over: Any) -> dict[str, Any]:
+        entry = {"pid": 4242, "start_time": "st-4242", "port": 9000, "spawn_instance": "sp-1"}
+        entry.update(over)
+        return entry
+
+    def _verdict(self, owners: list[int] | None = None, app: str = "app") -> tuple[bool, str]:
+        return bmod._adoption_provenance(app, [111, 222] if owners is None else owners)
+
+    def test_the_recorded_leader_still_holding_the_port_is_ours(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A pid plus a start instant names one process for good, on every platform."""
+
+        bmod._write_pidfile({"app": self._row(pid=111, start_time="st-111")})
+        monkeypatch.setattr(bmod, "_proc_start_time", lambda pid: f"st-{pid}")
+        # No instance route is needed, so this host need not be able to vouch at all.
+        monkeypatch.setattr(bmod, "group_vouching_available", lambda: False)
+        attributed, reason = self._verdict([111])
+        assert attributed is True
+        assert "every owner [111]" in reason
+
+    def test_a_recycled_leader_pid_is_not_ours(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """The recorded number came back as an unrelated process: the start instant differs."""
+
+        bmod._write_pidfile({"app": self._row(pid=111, start_time="st-111", spawn_instance=None)})
+        monkeypatch.setattr(bmod, "_proc_start_time", lambda _pid: "st-recycled")
+        attributed, reason = self._verdict()
+        assert attributed is False
+        assert "no spawn instance" in reason
+
+    def test_every_member_of_the_recorded_spawn_is_ours(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The leader has exited; pre-fork workers of the same spawn hold the port.
+
+        The whole tree inherits the spawn instance, so the token attributes members
+        whose leader's pid names nothing live.
+        """
+
+        bmod._write_pidfile({"app": self._row()})
+        monkeypatch.setattr(bmod, "_proc_start_time", lambda _pid: None)
+        monkeypatch.setattr(bmod, "group_vouching_available", lambda: True)
+        monkeypatch.setattr(bmod, "_env_spawn_instance", lambda _pid: "sp-1")
+        attributed, reason = self._verdict()
+        assert attributed is True
+        assert "every owner [111, 222]" in reason
+
+    def test_one_foreign_co_owner_refuses_the_whole_set(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A same-UID SO_REUSEPORT co-binder shares the winning dispatch tier.
+
+        Every captured owner enters the managed set and is signalled at stop, and
+        the start-time token stop re-checks was captured at the same moment, so it
+        confirms the co-binder rather than excluding it. Attributing the set from
+        one match would hand stop an unrelated process to terminate.
+        """
+
+        bmod._write_pidfile({"app": self._row()})
+        monkeypatch.setattr(bmod, "_proc_start_time", lambda _pid: None)
+        monkeypatch.setattr(bmod, "group_vouching_available", lambda: True)
+        monkeypatch.setattr(
+            bmod, "_env_spawn_instance", lambda pid: "sp-1" if pid == 111 else "sp-stranger"
+        )
+        attributed, reason = self._verdict()
+        assert attributed is False
+        assert "[222]" in reason
+        assert "not placed by this gateway for this app" in reason
+
+    def test_an_empty_owner_set_is_not_ours(self) -> None:
+        bmod._write_pidfile({"app": self._row()})
+        attributed, reason = self._verdict([])
+        assert attributed is False
+        assert reason == "no owning pid to attribute"
+
+    def test_a_survivor_of_a_prior_install_of_the_same_name_is_not_ours(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The defect this guard exists for.
+
+        The listener is a real Kiro Crew app backend and it answers on the port
+        the manifest declares, but it belongs to a spawn of the app that used
+        this name before: its instance is a different one.
+        """
+
+        bmod._write_pidfile({"app": self._row(spawn_instance="sp-current")})
+        monkeypatch.setattr(bmod, "_proc_start_time", lambda _pid: None)
+        monkeypatch.setattr(bmod, "group_vouching_available", lambda: True)
+        monkeypatch.setattr(bmod, "_env_spawn_instance", lambda _pid: "sp-previous-install")
+        attributed, reason = self._verdict()
+        assert attributed is False
+        assert "not placed by this gateway for this app" in reason
+
+    def test_no_recorded_spawn_is_not_ours(self) -> None:
+        """Nothing was recorded, so nothing attributes the listener.
+
+        This is the state an uninstall leaves behind: stopping the backend drops
+        the app's row, so a survivor that rebinds the port meets an empty record
+        on the next install's first start.
+        """
+
+        bmod._write_pidfile({"other-app": self._row()})
+        attributed, reason = self._verdict()
+        assert attributed is False
+        assert reason == "no spawn recorded for this app"
+
+    def test_an_unreadable_record_is_not_ours(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """A record that cannot be read decides nothing, so it decides against adoption."""
+
+        def _boom() -> dict[str, Any]:
+            raise OSError("pidfile unreadable")
+
+        monkeypatch.setattr(bmod, "_read_pidfile", _boom)
+        attributed, reason = self._verdict()
+        assert attributed is False
+        assert "unreadable" in reason
+
+    def test_a_malformed_row_is_not_ours(self) -> None:
+        bmod._write_pidfile({"app": "not-a-mapping"})
+        attributed, reason = self._verdict()
+        assert attributed is False
+        assert reason == "no spawn recorded for this app"
+
+    def test_a_row_with_no_instance_cannot_vouch_a_tree_member(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Residual, pinned at its current answer: a spawn recorded without a
+        token has nothing to attribute a surviving member with, so the member is
+        refused. Self-healing forward -- the next spawn records a token."""
+
+        bmod._write_pidfile({"app": self._row(spawn_instance=None)})
+        monkeypatch.setattr(bmod, "_proc_start_time", lambda _pid: None)
+        monkeypatch.setattr(bmod, "group_vouching_available", lambda: True)
+        attributed, reason = self._verdict()
+        assert attributed is False
+        assert "no spawn instance to vouch its tree with" in reason
+
+    def test_a_host_that_cannot_read_an_instance_refuses_a_tree_member(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Residual, pinned at its current answer: the token read is
+        ``/proc/<pid>/environ``, which exists on Linux alone. Elsewhere a
+        surviving member whose leader is gone cannot be attributed, and the
+        reason says so rather than reading as "not ours"."""
+
+        bmod._write_pidfile({"app": self._row()})
+        monkeypatch.setattr(bmod, "_proc_start_time", lambda _pid: None)
+        monkeypatch.setattr(bmod, "group_vouching_available", lambda: False)
+        monkeypatch.setattr(
+            bmod,
+            "_env_spawn_instance",
+            lambda _pid: pytest.fail("read on a host with no oracle"),
+        )
+        attributed, reason = self._verdict()
+        assert attributed is False
+        assert "cannot read a process's spawn instance" in reason
+
+
+# ---------------------------------------------------------------------------
+# Spawn body: adoption provenance, through the spawn body
+# ---------------------------------------------------------------------------
+
+
+class TestAdoptionProvenanceAtTheSpawnBody:
+    @pytest.fixture()
+    def occupied(self, spawn_root: Any, monkeypatch: pytest.MonkeyPatch) -> Any:
+        (spawn_root / "server.py").write_text("x = 1\n")
+        _install_fake_socket(monkeypatch, connect_exc=None)
+        monkeypatch.setattr(
+            bmod, "popen_limited", lambda *_a, **_k: pytest.fail("spawned onto a taken port")
+        )
+        monkeypatch.setattr(bmod, "_app_enabled_state", lambda _name: True)
+        monkeypatch.setattr(bmod, "loopback_urlopen", lambda *_a, **_k: _FakeResp(200))
+        monkeypatch.setattr(bmod, "_proc_start_time", lambda pid: f"st-{pid}")
+        _stub_listeners(monkeypatch, [bmod.platform_compat.PortListener(555, "127.0.0.1", "4")])
+        return spawn_root
+
+    def _run(self, port: int) -> AppProcess | None:
+        return bmod._start_app_backend_body("adoptee", _manifest("server.py", port=str(port)))
+
+    def test_an_unattributed_healthy_listener_is_not_adopted(
+        self, occupied: Any, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """End to end: healthy, on the declared port, and still refused.
+
+        No record names it, so no process table entry is created -- the app does
+        not start on a listener the gateway does not own. The port claim taken
+        before the branch is released by the caller's spawn bookkeeping, as it is
+        on every other refusal here.
+        """
+
+        with caplog.at_level(logging.WARNING):
+            assert self._run(bmod._MIN_PORT + 21) is None
+        assert any("refusing to adopt" in r.message for r in caplog.records)
+        assert "adoptee" not in bmod._processes
+
+    def test_the_refusal_is_audited_as_unattributed(
+        self, occupied: Any, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The audit trail records the verdict reached, not the verdict attempted."""
+
+        sink = MagicMock()
+        monkeypatch.setattr(bmod, "sel", lambda: sink)
+        assert self._run(bmod._MIN_PORT + 22) is None
+        outcomes = [c.kwargs.get("outcome") for c in sink.log_api_access.call_args_list]
+        assert "refused_unattributed" in outcomes
+        assert "adopted" not in outcomes
+
+    def test_an_attributed_listener_is_adopted_and_audited(
+        self, occupied: Any, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        bmod._write_pidfile(
+            {"adoptee": {"pid": 555, "start_time": "st-555", "port": 0, "spawn_instance": "sp-a"}}
+        )
+        sink = MagicMock()
+        monkeypatch.setattr(bmod, "sel", lambda: sink)
+        ap = self._run(bmod._MIN_PORT + 23)
+        assert ap is not None
+        assert ap.adopted_pids == [555]
+        outcomes = [c.kwargs.get("outcome") for c in sink.log_api_access.call_args_list]
+        assert "adopted" in outcomes
+        assert "refused_unattributed" not in outcomes
+
+    def test_a_free_port_never_consults_provenance(
+        self, spawn_root: Any, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Nothing is listening, so there is no listener to attribute and the
+        ordinary spawn path is unchanged."""
+
+        (spawn_root / "server.py").write_text("x = 1\n")
+        _capture_popen(monkeypatch)
+        monkeypatch.setattr(
+            bmod,
+            "_adoption_provenance",
+            lambda *_a, **_k: pytest.fail("provenance consulted with no listener to judge"),
+        )
+        with pytest.raises(_StopSpawn):
+            bmod._start_app_backend_body(
+                "freeport", _manifest("server.py", port=str(bmod._MIN_PORT + 24))
+            )
+
+
+# ---------------------------------------------------------------------------
+# Recovery: re-binding an adopted backend's owners
+# ---------------------------------------------------------------------------
+
+
+class TestRebindAttributesTheNewOwners:
+    """Recovery re-captures owners, so it re-asks whose they are.
+
+    This path runs after an adopted backend stops answering. The set it captures
+    can be a different population from the one adoption attributed, so inheriting
+    that verdict would let an unrelated listener answering the declared health path
+    be written into the owner record and promoted -- the same shape a start refuses,
+    reached through recovery.
+    """
+
+    @pytest.fixture()
+    def adopted(self, monkeypatch: pytest.MonkeyPatch) -> AppProcess:
+        ap = AppProcess(
+            app_name="rebindee",
+            port=bmod._MIN_PORT + 30,
+            pid=0,
+            proc=None,
+            healthy=False,
+            started_at=0.0,
+            log_path="/dev/null",
+            adopted_pids=[111],
+            adopted_start_times={111: "st-111"},
+            gateway_started=True,
+            admitted_builtin=False,
+        )
+        with bmod._lock:
+            bmod._processes["rebindee"] = ap
+        monkeypatch.setattr(
+            bmod, "_capture_adopted_owners", lambda *_a, **_k: ([777], {777: "st-777"})
+        )
+        return ap
+
+    def test_an_unattributed_replacement_is_not_bound(
+        self, adopted: AppProcess, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """The recorded owners survive untouched, so stop still aims where it did."""
+
+        monkeypatch.setattr(bmod, "_adoption_provenance", lambda *_a: (False, "stranger"))
+        with caplog.at_level(logging.WARNING):
+            assert bmod._rebind_adopted_owners(adopted, "/health") is False
+        assert any("refusing to re-bind" in r.message for r in caplog.records)
+        assert adopted.adopted_pids == [111]
+        assert adopted.adopted_start_times == {111: "st-111"}
+
+    def test_the_refusal_is_audited(
+        self, adopted: AppProcess, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr(bmod, "_adoption_provenance", lambda *_a: (False, "stranger"))
+        sink = MagicMock()
+        monkeypatch.setattr(bmod, "sel", lambda: sink)
+        assert bmod._rebind_adopted_owners(adopted, "/health") is False
+        outcomes = [c.kwargs.get("outcome") for c in sink.log_api_access.call_args_list]
+        assert outcomes == ["refused_unattributed"]
+
+    def test_an_attributed_replacement_is_bound(
+        self, adopted: AppProcess, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr(bmod, "_adoption_provenance", lambda *_a: (True, "ours"))
+        assert bmod._rebind_adopted_owners(adopted, "/health") is True
+        assert adopted.adopted_pids == [777]
+        assert adopted.adopted_start_times == {777: "st-777"}
+
+    def test_the_captured_set_is_what_gets_judged(
+        self, adopted: AppProcess, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Not the set already on the record -- judging that would re-confirm the
+        owners the adoption already cleared and never look at the newcomers."""
+
+        seen: list[tuple[str, list[int]]] = []
+
+        def _judge(app_name: str, owners: list[int]) -> tuple[bool, str]:
+            seen.append((app_name, list(owners)))
+            return True, "ours"
+
+        monkeypatch.setattr(bmod, "_adoption_provenance", _judge)
+        assert bmod._rebind_adopted_owners(adopted, "/health") is True
+        assert seen == [("rebindee", [777])]
+
+
+# ---------------------------------------------------------------------------
+# A refused stop leaves the retry able to attribute the listener
+
+
+class TestARefusedStopRestoresTheProvenanceRecord:
+    """The stop drops the app's pidfile row inside its lifecycle transition,
+    before it signals anything, and it can then refuse and restore tracking.
+
+    That row is where an adopted backend's provenance is read from, so a refusal
+    that leaves it dropped makes the retry's re-bind refuse on "no spawn recorded"
+    for good: a withdrawn trust ceiling could never converge on a listener that
+    keeps serving, and across a restart the listener stops being managed at all.
+    Whatever the transition removed is put back on every refusal.
+    """
+
+    @pytest.fixture(autouse=True)
+    def _fast_wait(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setattr(bmod, "_wait_for_pids", lambda _pids, timeout=2.0: None)
+
+    ROW = {"pid": 4242, "start_time": "st-4242", "port": 9000, "spawn_instance": "sp-keep"}
+
+    def _track(self, **kwargs: Any) -> AppProcess:
+        ap = AppProcess(app_name="ext", port=bmod._MIN_PORT + 13, pid=0, proc=None, **kwargs)
+        with bmod._lock:
+            bmod._processes["ext"] = ap
+            bmod._allocated_ports["ext"] = ap.port
+        bmod._write_pidfile({"ext": dict(self.ROW)})
+        return ap
+
+    def test_a_refusal_with_no_recorded_pids_puts_the_row_back(self) -> None:
+        self._track(healthy=True)
+        assert bmod.stop_app_backend("ext") is False
+        assert bmod._read_pidfile().get("ext") == self.ROW
+
+    def test_a_refusal_on_a_replacement_still_serving_puts_the_row_back(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        self._track(adopted_pids=[111], adopted_start_times={111: "st-111"}, healthy=True)
+        monkeypatch.setattr(bmod, "_proc_start_time", lambda _pid: "st-111")
+        monkeypatch.setattr(bmod.platform_compat, "kill_pid_pinned", lambda *_a: True)
+        monkeypatch.setattr(bmod.platform_compat, "pid_exists", lambda _pid: False)
+        monkeypatch.setattr(
+            bmod, "_health_probe", lambda *_a, **_k: bmod.HealthProbeOutcome.answered(200)
+        )
+        assert bmod.stop_app_backend("ext", _retry_if_serving="/health") is False
+        assert bmod._read_pidfile().get("ext") == self.ROW
+
+    def test_a_refusal_on_a_descendant_still_serving_puts_the_row_back(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The exited-root descendant-serving refusal restores the row too.
+
+        A launcher root exited while a forked worker still answers the declared
+        port, and a withdrawn trust ceiling calls stop with ``_retry_if_serving``.
+        The drain finds the survivor (``_drain_exited_root_tree`` -> False), the
+        ceiling refuses -- and that refusal must restore the row it dropped, or the
+        un-trusted listener it declined to stop becomes permanently unattributable:
+        ``_adoption_provenance`` answers "no spawn recorded" and the reap has no
+        pid/start_time to census it from.
+        """
+
+        proc = _fake_proc(pid=4242, returncode=-15)  # a spawned root that has exited
+        ap = AppProcess(
+            app_name="ext",
+            port=bmod._MIN_PORT + 13,
+            pid=4242,
+            pid_start_time="st-4242",
+            proc=proc,
+            healthy=True,
+        )
+        with bmod._lock:
+            bmod._processes["ext"] = ap
+            bmod._allocated_ports["ext"] = ap.port
+        bmod._write_pidfile({"ext": dict(self.ROW)})
+        # The drain reports a survivor, so the ceiling refuses outright.
+        monkeypatch.setattr(bmod, "_drain_exited_root_tree", lambda *_a, **_k: False)
+        assert bmod.stop_app_backend("ext", _retry_if_serving="/health") is False
+        assert bmod._read_pidfile().get("ext") == self.ROW
+
+    def test_a_successful_stop_leaves_the_row_dropped(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The restore undoes a refusal, never a stop that worked -- a row that
+        outlived its backend would attribute a later listener to a dead spawn."""
+
+        self._track(adopted_pids=[111], adopted_start_times={111: "st-111"}, healthy=True)
+        monkeypatch.setattr(bmod, "_proc_start_time", lambda _pid: "st-111")
+        monkeypatch.setattr(bmod.platform_compat, "kill_pid_pinned", lambda *_a: True)
+        monkeypatch.setattr(bmod.platform_compat, "pid_exists", lambda _pid: False)
+        assert bmod.stop_app_backend("ext") is True
+        assert "ext" not in bmod._read_pidfile()
+
+    def test_a_newer_spawn_keeps_its_own_row(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """A restore must not overwrite an identity recorded after the removal:
+        that would aim the stale-reap and provenance at a process that is gone."""
+
+        newer = {"pid": 5555, "start_time": "st-5555", "port": 9001, "spawn_instance": "sp-new"}
+        self._track(healthy=True)
+        real_forget = bmod._forget_app_pid
+
+        def _forget_then_respawn(app_name: str) -> dict[str, Any] | None:
+            removed = real_forget(app_name)
+            bmod._write_pidfile({app_name: dict(newer)})
+            return removed
+
+        monkeypatch.setattr(bmod, "_forget_app_pid", _forget_then_respawn)
+        assert bmod.stop_app_backend("ext") is False
+        assert bmod._read_pidfile().get("ext") == newer
+
+    def test_an_untracked_stop_leaves_the_recovery_row_intact(self) -> None:
+        """A stop for an app this process never tracked (nothing in ``_processes``)
+        must not discard the recorded row. That row is what a later start attributes
+        an adopted survivor against; forgetting it here on a stop that knew nothing
+        of the backend would strand the survivor, unadoptable."""
+
+        bmod._write_pidfile({"ext": dict(self.ROW)})
+        with bmod._lock:
+            bmod._processes.pop("ext", None)
+        assert bmod.stop_app_backend("ext") is False
+        assert bmod._read_pidfile().get("ext") == self.ROW
+
+    def test_forget_backend_provenance_drops_the_row_and_hands_it_back(self) -> None:
+        """An UPDATE invalidates the pre-update row before the restart, so the
+        restart cannot re-adopt a survivor running the OLD code as the new version.
+        The row is handed back so the update's ROLLBACK can restore it — on a failed
+        update the old backend is still the app's and must stay attributable."""
+
+        bmod._write_pidfile({"upd": dict(self.ROW)})
+        handed_back = bmod.forget_backend_provenance("upd")
+        assert handed_back == self.ROW
+        assert "upd" not in bmod._read_pidfile()
+        # Rollback restores exactly what was dropped.
+        bmod._restore_app_pid("upd", handed_back)
+        assert bmod._read_pidfile().get("upd") == self.ROW
+
+    def test_forget_backend_provenance_raises_when_the_delete_is_not_confirmed(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A swallowed pidfile write (ENOSPC/EDQUOT: the row leaves memory but stays
+        on disk) must NOT be reported as a successful delete — a caller that then
+        restarts would adopt the stale-row survivor. forget_backend_provenance
+        confirms the write landed and raises PidfileDeleteFailed otherwise, so the
+        update/uninstall caller aborts the restart."""
+
+        bmod._write_pidfile({"upd": dict(self.ROW)})
+        # Simulate the write failing to land (atomic_write swallows OSError -> False).
+        monkeypatch.setattr(bmod, "_write_pidfile", lambda data: False)
+        with pytest.raises(bmod.PidfileDeleteFailed):
+            bmod.forget_backend_provenance("upd")
+
+    def test_forget_backend_provenance_is_a_noop_for_an_absent_row(self) -> None:
+        """No row to drop is not a failure: it returns None without raising, so an
+        app that never recorded a spawn does not block its own update."""
+
+        with bmod._lock:
+            bmod._processes.pop("absent", None)
+        bmod._write_pidfile({})
+        assert bmod.forget_backend_provenance("absent") is None
+
+    def test_forget_backend_provenance_raises_when_the_store_is_unreadable(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A read failure must not masquerade as 'no row'. _read_pidfile swallows an
+        OSError and returns {}, so data.pop would yield None — indistinguishable from
+        an absent row — and the caller would report a confirmed delete that never
+        happened and restart onto the survivor the stale row still attributes.
+        forget_backend_provenance reads strictly and raises PidfileDeleteFailed."""
+
+        bmod._write_pidfile({"upd": dict(self.ROW)})
+
+        def _boom() -> dict[str, Any]:
+            raise OSError("disk went away")
+
+        monkeypatch.setattr(bmod, "_read_pidfile_strict", _boom)
+        with pytest.raises(bmod.PidfileDeleteFailed):
+            bmod.forget_backend_provenance("upd")
+
+    def test_read_pidfile_strict_raises_on_a_corrupt_store(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        """The strict reader surfaces a corrupt file as OSError (so the confirmed-delete
+        path aborts) while a MISSING file is still an empty dict — there is simply no
+        row to delete. The lenient _read_pidfile keeps masking both as {}."""
+
+        pf = tmp_path / "app_backends.pids.json"
+        monkeypatch.setattr(bmod, "_pidfile_path", lambda: pf)
+        # Missing file: both readers agree it is empty.
+        assert bmod._read_pidfile_strict() == {}
+        # Corrupt file: lenient returns {}, strict raises OSError.
+        pf.write_text("{not json")
+        assert bmod._read_pidfile() == {}
+        with pytest.raises(OSError):
+            bmod._read_pidfile_strict()
 
 
 # ---------------------------------------------------------------------------
@@ -5013,6 +5560,308 @@ def _app(
         "origin": origin,
         "manifest": {"backend": {"entryPoint": "server.py"}} if manifest is None else manifest,
     }
+
+
+class TestRestartKeepsTheSpawnRowUntilTheRespawnDecides:
+    """The exited leader's row is the spawn tree's only witness, so the restart keeps it.
+
+    A restart that drops the row before the respawn asks leaves the adopt branch with
+    no record to read: a pre-fork worker or a detached child of this SAME app that is
+    still holding the declared port cannot be attributed, the respawn refuses it, and
+    the app stays down for as long as its own orphan keeps the port. The drop therefore
+    happens once the attempt has decided, and only when nothing the row attributes is
+    left tracked.
+    """
+
+    ROW: dict[str, Any] = {
+        "pid": 617,
+        "start_time": "st-617",
+        "port": 9136,
+        "spawn_instance": "sp-tree",
+    }
+
+    @pytest.fixture(autouse=True)
+    def _fast_backoff(self, monkeypatch: pytest.MonkeyPatch) -> list[float]:
+        delays: list[float] = []
+        monkeypatch.setattr(
+            bmod,
+            "shutdown_event",
+            SimpleNamespace(
+                is_set=lambda: False,
+                wait=lambda delay: delays.append(delay) or False,
+            ),
+        )
+        monkeypatch.setattr(bmod, "_app_enabled_state", lambda _name: True)
+        bmod._write_pidfile({"app": dict(self.ROW)})
+        return delays
+
+    @staticmethod
+    def _track(name: str = "app") -> AppProcess:
+        ap = AppProcess(
+            app_name=name,
+            port=9136,
+            pid=617,
+            pid_start_time="st-617",
+            proc=_fake_proc(pid=617, returncode=-15),
+            healthy=False,
+            mcp_healthy=False,
+        )
+        with bmod._lock:
+            bmod._processes[name] = ap
+            bmod._allocated_ports[name] = ap.port
+        return ap
+
+    def test_the_row_is_still_readable_when_the_respawn_asks(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The ordering pin: the respawn's own attribution needs the record intact."""
+
+        ap = self._track()
+        seen: list[dict[str, Any] | None] = []
+
+        def _start(name: str) -> AppProcess:
+            seen.append(bmod._read_pidfile().get(name))
+            replacement = AppProcess(app_name=name, port=9137, proc=_fake_proc(pid=618))
+            with bmod._lock:
+                bmod._processes[name] = replacement
+            return replacement
+
+        monkeypatch.setattr(bmod, "_start_app_backend", _start)
+        assert bmod._restart_exited_backend(ap, -15) is True
+        assert seen == [self.ROW]
+
+    def test_a_transient_spawn_failure_that_restores_tracking_keeps_the_row(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A restored retry must not drop the row a later exit would otherwise take.
+
+        The loop commits to superseding (arming the deferred drop), the respawn then
+        fails and ``_settle_superseding_start`` restores ``ap`` to tracking and answers
+        ``\"continue\"``. ``ap`` is tracked again with a non-None ``proc``, so the
+        adopted-instance guard would NOT save it -- the deferred drop must be DISARMED
+        on that restore, or the next exit reaches the ``finally`` and deletes the row of
+        a leader that is once again live and tracked, orphaning its group.
+
+        Driven by making the spawn fail and the settlement restore ``ap`` then, on the
+        re-entered loop, letting a shutdown end it: the row must survive.
+        """
+
+        ap = self._track()
+        calls = {"settle": 0}
+
+        def _settle(_name: str, _ap: AppProcess, _replacement: Any) -> str:
+            calls["settle"] += 1
+            if calls["settle"] == 1:
+                # Restore ap to tracking exactly as the real settle's "nothing tracked"
+                # branch does, and ask the loop to continue.
+                with bmod._lock:
+                    bmod._processes["app"] = _ap
+                return "continue"
+            return "return_false"
+
+        # Spawn fails transiently -> replacement is None; the app stays DECLARED
+        # (a manifest with a backend entryPoint), so the loop does not early-return
+        # True and falls through to the final settlement.
+        monkeypatch.setattr(bmod, "_start_app_backend", lambda _name: None)
+        monkeypatch.setattr(
+            bmod,
+            "get_app_manifest",
+            lambda _name: SimpleNamespace(backend=SimpleNamespace(entryPoint="app.py")),
+        )
+        monkeypatch.setattr(bmod, "_settle_superseding_start", _settle)
+
+        # A shutdown that trips only after the first wait, so the first pass proceeds
+        # to the failed spawn + settlement-restore, and the restored second pass exits.
+        state = {"waits": 0, "down": False}
+
+        def _wait(_delay: float) -> bool:
+            state["waits"] += 1
+            if state["waits"] >= 2:
+                state["down"] = True
+            return state["down"]
+
+        monkeypatch.setattr(
+            bmod,
+            "shutdown_event",
+            SimpleNamespace(is_set=lambda: state["down"], wait=_wait),
+        )
+        bmod._restart_exited_backend(ap, -15)
+        # The row survives: the restored, tracked leader still owns it.
+        assert bmod._read_pidfile().get("app") == self.ROW
+
+    def test_an_adopted_replacement_keeps_the_row_it_was_attributed_by(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Its ownership is re-read from this row on every re-bind, so the row stays."""
+
+        ap = self._track()
+        adopted = AppProcess(
+            app_name="app",
+            port=9136,
+            proc=None,
+            adopted_pids=[9001],
+            adopted_start_times={9001: "st-9001"},
+        )
+
+        def _start(name: str) -> AppProcess:
+            with bmod._lock:
+                bmod._processes[name] = adopted
+            return adopted
+
+        monkeypatch.setattr(bmod, "_start_app_backend", _start)
+        assert bmod._restart_exited_backend(ap, -15) is True
+        assert bmod._read_pidfile().get("app") == self.ROW
+
+    def test_a_fresh_spawn_keeps_its_own_row_and_not_the_exited_leader_s(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The drop stays keyed on the exited leader, so a successor's row survives it."""
+
+        ap = self._track()
+        successor = {
+            "pid": 618,
+            "start_time": "st-618",
+            "port": 9137,
+            "spawn_instance": "sp-new",
+        }
+
+        def _start(name: str) -> AppProcess:
+            bmod._write_pidfile({name: dict(successor)})
+            replacement = AppProcess(app_name=name, port=9137, proc=_fake_proc(pid=618))
+            with bmod._lock:
+                bmod._processes[name] = replacement
+            return replacement
+
+        monkeypatch.setattr(bmod, "_start_app_backend", _start)
+        assert bmod._restart_exited_backend(ap, -15) is True
+        assert bmod._read_pidfile().get("app") == successor
+
+    def test_a_respawn_that_produces_nothing_drops_the_stale_row(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Nothing is tracked, so the row names a process that is gone and it goes."""
+
+        ap = self._track()
+        monkeypatch.setattr(bmod, "_start_app_backend", lambda _name: None)
+        monkeypatch.setattr(bmod, "get_app_manifest", lambda _name: _manifest(""))
+        assert bmod._restart_exited_backend(ap, -15) is True
+        assert "app" not in bmod._read_pidfile()
+
+    def test_an_activation_denial_drops_the_row_on_its_early_return(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The removal covers every decided exit, including the ones before the spawn."""
+
+        ap = self._track()
+        monkeypatch.setattr(
+            bmod,
+            "_activation_denied",
+            lambda *_args: bmod.ActivationVerdict(denied="not admitted"),
+        )
+        monkeypatch.setattr(
+            bmod,
+            "_start_app_backend",
+            lambda _name: pytest.fail("a denied restart must not spawn"),
+        )
+        assert bmod._restart_exited_backend(ap, -15) is False
+        assert "app" not in bmod._read_pidfile()
+
+    def test_every_retry_can_still_read_the_row(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """A retrying loop asks attribution again, so the row outlives each attempt."""
+
+        ap = self._track()
+        seen: list[dict[str, Any] | None] = []
+        verdicts = [
+            bmod.ActivationVerdict(denied="evaluator down", transient=True),
+            bmod.ActivationVerdict(denied="not admitted"),
+        ]
+
+        def _verdict(*_args: Any) -> Any:
+            seen.append(bmod._read_pidfile().get("app"))
+            return verdicts[min(len(seen) - 1, len(verdicts) - 1)]
+
+        monkeypatch.setattr(bmod, "_activation_denied", _verdict)
+        monkeypatch.setattr(bmod, "get_app_manifest", lambda _name: _manifest("server.py"))
+        monkeypatch.setattr(
+            bmod,
+            "_start_app_backend",
+            lambda _name: pytest.fail("neither verdict admits a spawn"),
+        )
+        assert bmod._restart_exited_backend(ap, -15) is False
+        assert seen == [self.ROW, self.ROW]
+
+    def test_a_dropped_record_leaves_a_successor_s_own_row_alone(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A deliberate stop or a successor owns the row; the drop keys on the leader."""
+
+        ap = self._track()
+        successor = {"pid": 618, "start_time": "st-618", "port": 9137, "spawn_instance": "sp-2"}
+        bmod._write_pidfile({"app": dict(successor)})
+        with bmod._health_reconcile_lock:
+            with bmod._lock:
+                bmod._advance_lifecycle_locked("app", bmod._LIFECYCLE_STOP)
+                bmod._processes.pop("app")
+                bmod._allocated_ports.pop("app")
+                bmod._processes["app"] = AppProcess(
+                    app_name="app", port=9137, proc=_fake_proc(pid=618)
+                )
+        monkeypatch.setattr(
+            bmod,
+            "_start_app_backend",
+            lambda _name: pytest.fail("must not restart a stopped record"),
+        )
+        assert bmod._restart_exited_backend(ap, -15) is False
+        assert bmod._read_pidfile().get("app") == successor
+
+    def test_a_dropped_record_with_nothing_tracked_drops_the_stale_row(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Nothing is tracked, so the row names a process that is gone and it goes."""
+
+        ap = self._track()
+        with bmod._health_reconcile_lock:
+            with bmod._lock:
+                bmod._advance_lifecycle_locked("app", bmod._LIFECYCLE_STOP)
+                bmod._processes.pop("app")
+                bmod._allocated_ports.pop("app")
+        monkeypatch.setattr(
+            bmod,
+            "_start_app_backend",
+            lambda _name: pytest.fail("must not restart a stopped record"),
+        )
+        assert bmod._restart_exited_backend(ap, -15) is False
+        assert "app" not in bmod._read_pidfile()
+
+    def test_a_transient_early_return_keeps_the_row_for_the_surviving_group(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """An early return BEFORE the supersede commit must not drop the row.
+
+        The leader has exited but its group can still hold the declared port, and the
+        loop returns early -- ``installed.json`` reads transiently unreadable (the
+        tri-state ``_app_enabled_state`` is exactly for that), or a shutdown lands --
+        before it ever commits to superseding this leader. The base dropped the row
+        only AFTER those guards, so dropping it here would leave the surviving group
+        the app's port with nothing naming it: the reap has no row to census and the
+        next adoption reports no spawn recorded. The row therefore stays.
+        """
+
+        ap = self._track()
+        # The tracked proc has exited (returncode set), so the loop passes the
+        # liveness check and reaches the enabled-state guard, which reads as
+        # "transiently unreadable" (None) -> an early ``return False`` before the
+        # supersede commit.
+        monkeypatch.setattr(bmod, "_app_enabled_state", lambda _name: None)
+        monkeypatch.setattr(
+            bmod,
+            "_start_app_backend",
+            lambda _name: pytest.fail("must not respawn on a transient early return"),
+        )
+        assert bmod._restart_exited_backend(ap, -15) is False
+        # The row survives: the surviving group still has a witness for the reap and
+        # for a later attribution.
+        assert bmod._read_pidfile().get("app") == self.ROW
 
 
 class TestBootMcpReconcile:
