@@ -2301,7 +2301,7 @@ importing at load time only those listed before it and never the facade:
 | `autonudge_service/gate.py` | `_monitor_tick_is_quiet`, `_publish_pr_observation`, `_terminal_still_holds` |
 | `autonudge_service/judge_tick.py` | `_judge_tick_is_quiet` and the verdict stamp, labels and calibration rows |
 | `autonudge_service/firing.py` | `_timer`, `_run_fire_cycle`, `fire_now` |
-| `autonudge_service/mutations.py` | `add()`, `update()`, `remove()` and their unserialized bodies, `remove_sync`, `remove_by_slot`, `clear_terminal_monitor` |
+| `autonudge_service/mutations.py` | `add()`, `update()`, `remove()` and their unserialized bodies, `remove_sync`, `remove_by_slot`, `clear_terminal_monitor`; typed-goal lifecycle and shielded session-key pause transactions |
 | `autonudge_service/monitor_records.py` | `add_monitor`, `apply_monitor_probe`, `update_monitor`, `record_monitor_turn_completion` and every other structured-monitor transition |
 
 Each owner function that takes the service as `self` is a service method, bound on
@@ -2390,7 +2390,7 @@ deactivates with `completion_evidence_unavailable` while retaining the
 acknowledged fingerprint, so restart cannot duplicate the wake. Completion stops
 on the first exhausted runtime, turn, or token bound (in that precedence), and
 the completed-turn bound is skipped when it is zero, its unlimited sentinel, and
-otherwise validated against the universal eight-turn ceiling when constructed or
+otherwise validated against `MAX_MONITOR_AGENT_TURNS` when constructed or
 loaded. Approval-stall completion is terminal and budget exhaustion takes
 precedence when both apply.
 Claim, budget-stop, completion, and pre-turn dispatch-failure mutations are
@@ -2814,6 +2814,14 @@ GET `/api/file-office-slides?path=...` is the rendered-slides manifest for a `.p
 **MCP Custom Servers** (manual JSON path — Add Custom modal + per-server Edit JSON): POST `/api/mcp/custom` `{servers: {name: spec}, enable?: bool=false}` — user-authored specs (stdio `command`/`args`/`env` XOR remote `url`/`scopes`/`clientId`/`headers`, unknown keys rejected by name; header names/values are shape-checked and a fresh spec carrying the redaction marker as a header value is refused — it means the user pasted a redacted read payload), validate-all-then-write (no partial batch), collision → 409 with `conflicts` list, servers land disabled unless `enable: true` (the modal's "Enable immediately" tick is the consent act). GET `/api/mcp/custom/{name}` — full editable spec including env (the list endpoint omits env; prefilling from it would drop vars on save). PUT `/api/mcp/custom/{name}` — replace spec, 404 when not Kiro Crew-managed, always preserves enabled/disabled state (editing is not consent to run; a pasted `disabled: false` cannot smuggle an enable). Non-allowlisted keys already on the entry (`disabledTools`, `autoApprove`, …) round-trip: an unmodified GET→PUT save succeeds and their on-disk values are preserved verbatim — they cannot be edited or removed via this endpoint (dropping `disabledTools` would silently widen the tool surface); modifying one → 400. `headers` straddles that line: an entry WITHOUT stored headers may author them on PUT like a fresh add, but once values exist on disk they join the carried set — reads redact header values, so an editable headers key would let the redaction markers overwrite the real credentials (modifying stored headers → 400 `stored_headers_not_editable`; changing them means remove + re-add, same as a `url` change with stored headers). Fresh POSTs carry nothing, so the tight allowlist still applies. All three SEL-audited; writes share the mcp.py file lock + entry helpers with discover-install. Consent-disabled entries (custom adds + registry installs) surface in the servers table as `Disabled` rows — `list_servers()` marks Kiro Crew-scope `disabled: true` entries (incl. when config sync mirrors the disable into the agent file) and a disabled server is never probed (a probe would spawn the unconsented process); the table's enable action is the reachable consent step. The refusal is enforced inside **`probe_server()`** — the one function every probe passes through, ahead of its local/remote dispatch — so a new per-server entry point cannot become a way around the consent gate by forgetting to pre-filter. `probe_all()` keeps its own `disabled` filter as defense-in-depth and to shape its result (disabled rows are omitted from `GET /api/mcp/probe` rather than returned with `status="disabled"`); a caller may add a friendlier error on top (Mochi's `GET /api/apps/mochi/mcp-tools/{name}` answers 409 `server_disabled`), but that is UX, not the safety property. The refusal deliberately does NOT write the probe cache: it is keyed by name and shared with `GET /api/mcp`, so recording an empty `disabled` result would erase the tool list an earlier real probe stored. `GET /api/mcp` rows carry `kirocrewManaged` (gates the Edit JSON action).
 
 ### Frontend (React SPA)
+
+Redaction details cards hand keyboard focus from their opener into the card
+after its reveal. The reply's `RedactionProvider` records that opener; a delayed
+handoff runs only while the same card is open and that opener still has focus.
+Moving to another control or a dialog, including the card's own confirmation,
+keeps focus there. Closing or switching cards cancels the pending handoff even
+while an exit animation keeps the old card mounted. Close and Escape still
+return focus to the recorded opener.
 
 In split view the geometric top-left pane stands in for the single-chat title
 row at the surface's top-left: on desktop it clears the shell's sessions-sidebar
@@ -3429,7 +3437,7 @@ the one exception and reads zero as unlimited, the same meaning legacy
 `max_cycles` carries: zero is skipped rather than enforced, an explicit positive
 value is bounded by `MAX_MONITOR_AGENT_TURNS`, and MCP schemas, `validation.py`,
 the REST handler, the session directive applier and the dashboard contract all
-publish a minimum of 0 for it alone. Its default stays a positive eight turns.
+publish a minimum and default of 0 for it alone.
 Raising
 or lowering the policy never rewrites an existing loop's timestamps, runtime or
 active state; a stored budget above the ceiling runs to its stored deadline.
@@ -3958,8 +3966,9 @@ requires loopback plus `X-Internal-Secret`, the handler reasserts that trust
 before accepting `X-Session-Key`, and browser-cookie fallback is forbidden.
 Both the internal-secret decision and a missing or unsupported session binding
 are best-effort SEL audited before the handler returns.
-Creation uses the same positive defaults and bounds as MCP; zero is never
-unlimited. Dashboard creation is create-only under the service lock and returns
+Creation uses the same defaults and bounds as MCP. Only `max_agent_turns`
+defaults to zero for unlimited wakes; runtime, token and provider-error budgets
+remain positive. Dashboard creation is create-only under the service lock and returns
 409 if any automation already occupies the slot, even when that record was armed
 after the dashboard's last read.
 Structured creation never resolves or unlinks the legacy loop stop sentinel, so
@@ -3989,8 +3998,12 @@ same service lock as structured creation, so a stale empty snapshot cannot
 replace an automation armed by another tab. Other legacy callers retain explicit
 replacement semantics, but the agent-facing `monitor_start` and `monitor_watch`
 directives are create-only across both record kinds, with one deliberate split.
-Dashboard REST creates keep any-record occupancy: a 409 that never discards a
-retained record, active or stopped, preserving inspection evidence. The two
+Dashboard REST creates keep any-record occupancy, except an explicit owner watch
+through `POST /api/monitors` may replace an inactive `suggested` goal. A separate
+internal flag grants this exception; the store rechecks status under its mutation
+lock and uses the existing atomic replacement and credential rollback. Started
+and paused goals and retained monitor evidence remain protected. The audit
+`source` label and model directive provenance do not grant the exception. The two
 session-directive arms additionally opt into `replace_stopped`, which narrows
 their refusal to records that still occupy the session — an ACTIVE automation,
 or a retained stop that is evidence. Only system-imposed stops are re-armable:
@@ -4133,6 +4146,15 @@ non-actionable blocked state instead. The normalizer consumes the durable
 provider-error, and token counters. It never infers wakes from current delivery
 state.
 
+Typed goal suggestions travel through that same legacy record and query with
+`goal.status="suggested"` and `active=false`. The composer offers Start beside the
+suggested outcome and opens its criteria and run limits in the existing popup.
+The owner-authenticated PATCH sends `active=true` and the observed
+`expected_generation`; the service accepts only the current revision and persists
+the first start before scheduling work. Model goal directives cannot perform this
+transition. The trusted `/goal` slash dispatcher supplies explicit-start authority
+directly and remains usable when `monitoring.goal_suggestions` is disabled.
+
 Redux owns the only mutable automation collection. Initial connection starts the
 legacy and structured list reads together, fences their combined result by
 connection generation, protects each slot changed by a newer live frame or
@@ -4212,13 +4234,13 @@ cannot host a direct monitor turn and disables create, edit, restart, and
 legacy-loop controls for those modes; that explanation renders on BOTH views,
 so a disabled goal form is never left without a reason. Stop remains available for an existing
 monitor so an operator can always disarm stale state. A new pull-request monitor
-starts from the 300-second cadence, 14,400-second runtime, eight-turn,
-250,000-token, and three-provider-error defaults. Terminal evidence remains read-only and exposes
+defaults to a 300-second cadence, a 14,400-second runtime, unlimited completed
+turns, 250,000 tokens, and three provider errors. Terminal evidence remains read-only and exposes
 Restart as its sole mutation. Creating a different monitor while terminal evidence
 is retained is disabled until bulk slot cleanup fences every slot before awaiting,
 so an archived slot cannot be repopulated by an in-flight replacement. The form
 enforces the backend bounds: cadence 15–86,400 seconds, runtime 1–604,800 seconds,
-agent turns 0–8 where 0 is unlimited, tokens
+agent turns 0–1,000 where 0 is unlimited, tokens
 1–1,000,000, provider errors 1–20, and at most 1,000 wake-instruction characters.
 Each field exposes the same HTML bound and a localized inline error. Updates
 track dirty fields, reconcile untouched values from same-monitor WebSocket

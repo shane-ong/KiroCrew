@@ -3560,6 +3560,8 @@ class SessionManager:
         preserve_queue: bool = False,
         on_soft: Callable[[], Awaitable[None]] | None = None,
         on_hard: Callable[[], Awaitable[None]] | None = None,
+        goal_state: Any = None,
+        pause_goal: bool = False,
     ) -> StopOutcome:
         """Cooperatively stop a turn, escalating to reset and eager respawn."""
         return await self._lifecycle_boundary().stop_turn(
@@ -3568,6 +3570,8 @@ class SessionManager:
             preserve_queue=preserve_queue,
             on_soft=on_soft,
             on_hard=on_hard,
+            goal_state=goal_state,
+            pause_goal=pause_goal,
         )
 
     def stop_generation(self, key: str) -> int:

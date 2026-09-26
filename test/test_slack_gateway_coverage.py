@@ -2356,6 +2356,63 @@ def _webex_orchestrator(transport: MagicMock | None) -> Any:
     return orch
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize("channel", ["discord", "webex"])
+@pytest.mark.parametrize("queue_mode", ["steer", "queue"])
+async def test_plain_nudge_losing_busy_race_never_enters_human_work(
+    monkeypatch, channel, queue_mode
+):
+    """The dispatcher observes a human claim made after the gateway's idle check."""
+    from test_discord import _dispatcher as discord_dispatcher
+    from test_discord import _prime_live as prime_discord
+    from test_webex_dispatch import FakeClient, FakeCtx, FakeProvider, FakeSessions
+    from test_webex_dispatch import _dispatcher as webex_dispatcher
+    from test_webex_dispatch import _prime_live as prime_webex
+
+    if channel == "discord":
+        dispatcher, client, sessions = discord_dispatcher({"u1"})
+        provider = sessions._gp
+        key = dispatcher.current_session_key("u1")
+        transport = _discord_transport(current_key=key)
+        orch = _discord_orchestrator(transport)
+        fire = orch._fire_discord_nudge
+        room = "c1"
+        prime = prime_discord
+    else:
+        provider = FakeProvider([])
+        sessions = FakeSessions(provider)
+        client = FakeClient()
+        dispatcher = webex_dispatcher(sessions, FakeCtx(), client)
+        key = dispatcher.current_session_key("a@b.test")
+        transport = _webex_transport(current_key=key)
+        orch = _webex_orchestrator(transport)
+        fire = orch._fire_webex_nudge
+        room = "ROOM"
+        prime = prime_webex
+        monkeypatch.setattr(sessions, "get_origin_link", lambda key: None, raising=False)
+    dispatcher.cfg.messaging.queue_mode = queue_mode
+    prime(dispatcher.cfg)
+    transport.dispatcher = dispatcher
+    resolved = []
+
+    async def resolve(principal):
+        assert not sessions.is_busy(key)
+        sessions._busy = True
+        resolved.append(principal)
+        return room
+
+    transport.resolve_conversation = resolve
+    result = await fire(_loop(key))
+
+    assert resolved, "the gateway's idle check must pass before the human takes the session"
+    assert result is False
+    assert provider.steered == []
+    assert sessions.queued == []
+    assert client.sent == []
+    assert sessions.begin_turns == 0
+    orch.autonudge_svc.remove.assert_not_called()
+
+
 class TestFireWebexNudge:
     """Synthetic-injection path for a Webex DM babysit loop."""
 

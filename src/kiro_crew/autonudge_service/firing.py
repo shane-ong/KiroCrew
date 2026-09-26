@@ -51,7 +51,7 @@ logger = logging.getLogger("kiro_crew.autonudge")
 
 async def _timer(self: AutoNudgeService, loop: NudgeLoop, delay: float | None = None) -> None:
     try:
-        await asyncio.sleep(loop.idle_secs if delay is None else delay)
+        await asyncio.sleep(loop.continuation_delay if delay is None else delay)
     except asyncio.CancelledError:
         return
     if shutdown_event.is_set():
@@ -288,7 +288,7 @@ async def _timer(self: AutoNudgeService, loop: NudgeLoop, delay: float | None = 
         # a loop removed during the observation is not resurrected by its own
         # in-flight tick.
         if loop.active and loop.id in self._loops:
-            loop.next_due_ts = time.time() + loop.idle_secs
+            loop.next_due_ts = time.time() + loop.continuation_delay
             self._persist_soon()
             self._arm_from_deadline(loop)
         return

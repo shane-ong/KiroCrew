@@ -10,6 +10,7 @@ from typing import Any
 
 from aiohttp import web
 
+from kiro_crew import goal_actions
 from kiro_crew.autonudge import binding_key_for
 from kiro_crew.autonudge import get_instance as _autonudge_get
 from kiro_crew.autonudge import is_structured_monitor_loop
@@ -241,6 +242,9 @@ _MONITOR_WITHHELD_LEGACY_FIELDS = frozenset(
         "judge_last_verdict",
         "judge_wake_pending",
         "judge_recent_verdicts",
+        # Goal metadata belongs to a plain pursuit loop, not this reduced
+        # structured-monitor projection.
+        "goal",
     }
 )
 
@@ -334,7 +338,7 @@ def _autonudge_loop_reading(loop: Any) -> dict[str, Any]:
     ``message`` is agent-controlled free text and is NOT included — it is not
     needed to verify arming, and leaving it out keeps this read narrow.
     """
-    return {
+    reading = {
         "id": loop.id,
         "active": bool(loop.active),
         "idle_secs": loop.idle_secs,
@@ -348,6 +352,9 @@ def _autonudge_loop_reading(loop: Any) -> dict[str, Any]:
         "stopped_reason": loop.stopped_reason,
         "has_banner": bool(loop.banner),
     }
+    if getattr(loop, "goal", None) is not None:
+        reading.update(goal_actions.goal_snapshot(loop))
+    return reading
 
 
 def _monitor_error(message: str, code: str, *, status: int = 400) -> web.Response:
@@ -607,7 +614,13 @@ async def api_session_monitor_get(request: web.Request) -> web.Response:
     svc = _autonudge_get()
     if svc is None:
         return web.json_response({"enabled": False, "monitor": None})
-    loop = svc.get_by_slot(binding)
+    try:
+        loop = goal_actions.goal_loop_for_session(request.app["state"], svc, binding)
+    except ValueError as exc:
+        return web.json_response(
+            {"error": str(exc), "code": "ambiguous_session_automation"},
+            status=409,
+        )
     if loop is None:
         # Nothing is armed on this session. This is the ONLY case that reads as
         # "not armed", and it is DISTINCT from an armed auto-nudge loop below.
@@ -717,6 +730,7 @@ async def api_monitor_create(request: web.Request) -> web.Response:
         caller=request.remote or "",
         monitor=config,
         replace_existing=False,
+        replace_suggested_goal=True,
         grant_owner_provider_credentials=True,
     )
     if error is not None:
@@ -1086,12 +1100,17 @@ async def api_autonudge_update(request: web.Request) -> web.Response:
         idle_secs=body.get("idle_secs"),
         max_cycles=body.get("max_cycles"),
         active=body.get("active"),
+        expected_generation=body.get("expected_generation"),
         max_runtime_secs=body.get("max_runtime_secs"),
         banner=body.get("banner"),
         source="dashboard",
         caller=request.remote or "",
     )
     if error is not None:
+        if existing is not None and existing.goal is not None:
+            return web.json_response(
+                {"error": error, "code": "autonudge_update_refused"}, status=status
+            )
         return web.json_response({"error": error}, status=status)
     return web.json_response({"ok": True, "loop": _serialize(loop)})
 

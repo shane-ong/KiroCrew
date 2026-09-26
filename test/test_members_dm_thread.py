@@ -1375,36 +1375,57 @@ class TestResumeGuards:
 
         from chat_test_helpers import _make_app
 
+        from kiro_crew import eventlog_hooks, members
+
         state = _make_state(tmp_path)
-        write_dm_binding(CREW, member=CREW, slot_key=member_slot_key(CREW))
-        key = f"dashboard:{member_slot_key(CREW)}"
+        slot_key = member_slot_key(CREW)
+        write_dm_binding(CREW, member=CREW, slot_key=slot_key)
+        key = f"dashboard:{slot_key}"
         log = state.conversation_log
         log.append(key, "user", "hello")
         log.update_metadata(key, {"agent": CREW, "mode": DM_SLOT_MODE})
 
-        real_read = read_dm_binding
+        real_read = members.read_dm_binding_for_slot
+        binding_reads = []
+        published_slots = []
 
-        def _publish_mid_await(slug):
-            # Simulate the concurrent WINNER: it published the slot (and
-            # hydrated the one disk message) while this request was suspended
-            # in the binding read.
-            slot = state.get_or_create_slot(member_slot_key(CREW), agent=CREW, mode=DM_SLOT_MODE)
-            slot.append("user", "hello", "msg msg-u")
-            return real_read(slug)
+        def _publish_on_late_read(requested_slot_key):
+            binding_reads.append(requested_slot_key)
+            binding = real_read(requested_slot_key)
+            # Leave the early read alone so the winner lands after the earlier
+            # live-slot checks, during the late binding await.
+            if len(binding_reads) == 2:
+                slot = state.get_or_create_slot(slot_key, agent=CREW, mode=DM_SLOT_MODE)
+                slot.append("user", "hello", "msg msg-u")
+                published_slots.append(slot)
+            return binding
 
         with _patch(
-            "kiro_crew.members.read_dm_binding",
-            side_effect=_publish_mid_await,
+            "kiro_crew.members.read_dm_binding_for_slot",
+            side_effect=_publish_on_late_read,
         ):
-            async with TestClient(TestServer(_make_app(state))) as client:
-                resp = await client.post(
-                    f"/api/chat/slots/{member_slot_key(CREW)}/resume", json={"key": key}
-                )
-                assert resp.status == 200
-        slot = state._slots[member_slot_key(CREW)]
-        # The loser did NOT hydrate a second copy of the transcript.
-        hellos = [m for m in slot.messages if m.get("content") == "hello"]
-        assert len(hellos) == 1, f"history duplicated: {len(hellos)} copies"
+            try:
+                async with TestClient(TestServer(_make_app(state))) as client:
+                    resp = await client.post(
+                        f"/api/chat/slots/{slot_key}/resume", json={"key": key}
+                    )
+                    assert resp.status == 200
+                    body = await resp.json()
+            finally:
+                # Keep the reader patch active until real event-log migration
+                # finishes: its binding reads must not publish another winner.
+                assert await asyncio.wait_for(
+                    asyncio.to_thread(eventlog_hooks.drain_for_shutdown, timeout=5),
+                    timeout=10,
+                ), "member event logging did not drain"
+            assert binding_reads == [slot_key, slot_key], "resume must reach both binding reads"
+            assert len(published_slots) == 1, "expected exactly one competing winner"
+            winner = published_slots[0]
+            assert body["key"] == winner.key, "resume did not return the competing winner"
+            assert state._slots[slot_key] is winner, "resume replaced the competing winner"
+            # The loser did NOT hydrate a second copy of the transcript.
+            hellos = [m for m in winner.messages if m.get("content") == "hello"]
+            assert len(hellos) == 1, f"history duplicated: {len(hellos)} copies"
 
     @pytest.mark.asyncio
     async def test_resume_of_a_closed_member_thread_succeeds(self, tmp_path):
