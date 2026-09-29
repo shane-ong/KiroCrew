@@ -1,12 +1,14 @@
 import { useLayoutEffect, useRef, useState, type KeyboardEvent } from 'react'
 import { useQuery } from '@tanstack/react-query'
-import { ChevronDown, ChevronRight } from 'lucide-react'
+import { ChevronDown, ChevronRight, FileText } from 'lucide-react'
 
 import { api } from '../api/client'
+import { useDevMode } from '../hooks/useDevMode'
 import ErrorNotice from '../components/ErrorNotice'
 import { fmtNumber } from '../i18n/format'
 import { i18nT } from '../i18n/t'
 import type { SubagentActivity } from '../types'
+import { PromptAsSentSection, promptForTurn, type PromptTrace } from './PromptAsSentSection'
 import { SessionBreakdownTree } from './SessionBreakdownTree'
 import { CATEGORY_FILL } from './contextSourceColors'
 
@@ -107,6 +109,9 @@ const BLOCK_KEY: Record<string, string> = {
   skill_hint: 'pages.contextBreakdown.block_skill_hint',
   loaded_skill: 'pages.contextBreakdown.block_loaded_skill',
   critical_rules: 'pages.contextBreakdown.block_critical_rules',
+  reply_format_rules: 'pages.contextBreakdown.block_reply_format_rules',
+  request_header: 'pages.contextBreakdown.block_request_header',
+  surface: 'pages.contextBreakdown.block_surface',
   response_preferences: 'pages.contextBreakdown.block_response_preferences',
   [EVERY_TURN_KEY]: 'pages.contextBreakdown.block_every_turn',
   unclassified: 'pages.contextBreakdown.block_unclassified',
@@ -130,13 +135,29 @@ export function groupBlocks(blocks: Record<string, number>): Record<string, numb
   return out
 }
 
+/** The "prompt text available" mark: Lucide's `FileText` in the accent colour.
+ *  Deliberately NOT a dot — a filled circle under a column read as a second
+ *  selection marker beside the chart's own ring-and-dashed-line, and the one cue
+ *  saying which turns can still be opened must not look like "which turn is
+ *  picked". Inside the chart it is a nested <svg> positioned by its top-left
+ *  corner (`x`/`y`); as an inline element it sits in the flow. */
+const PROMPT_MARK_SIZE = 10
+
+function PromptMarkGlyph({ x, y }: { x: number; y: number }) {
+  return <FileText size={PROMPT_MARK_SIZE} x={x - PROMPT_MARK_SIZE / 2} y={y - PROMPT_MARK_SIZE / 2} color="var(--accent)" aria-hidden="true" />
+}
+
+function PromptMark() {
+  return <FileText size={PROMPT_MARK_SIZE} className="lucide-inline shrink-0" color="var(--accent)" aria-hidden="true" />
+}
+
 /** Humanise a block id for the long tail: `hook_context` -> `Hook context`. */
 function humanise(label: string): string {
   const spaced = label.replace(/_/g, ' ')
   return spaced.charAt(0).toUpperCase() + spaced.slice(1)
 }
 
-function displayName(label: string): string {
+export function displayName(label: string): string {
   const key = BLOCK_KEY[label]
   return key ? i18nT(key) : humanise(label)
 }
@@ -173,6 +194,20 @@ function deltaText(current: number, previous: number | undefined): string | null
 const CHART_HEIGHT = 260
 const CHART_FALLBACK_WIDTH = 520
 const MARGIN = { top: 22, right: 28, bottom: 44, left: 60 }
+/** Approximate advance of one tabular digit or separator at the 11px tick font. */
+const TICK_CHAR_PX = 6.6
+/** Gap between the y-axis labels' right edge and the plot. */
+const TICK_GAP_PX = 10
+
+/**
+ * The left gutter the y-axis labels need: the fixed margin, or more when the
+ * top tick's label would not fit in it. Prompt sizes cross a million characters
+ * routinely (a session-start turn, or a prompt cut at the 2M per-turn cap), and
+ * a seven-digit label clipped to ",000,000" reads as a broken chart.
+ */
+export function axisGutter(topTickLabel: string): number {
+  return Math.max(MARGIN.left, Math.ceil(topTickLabel.length * TICK_CHAR_PX) + TICK_GAP_PX + 4)
+}
 /** Horizontal room one x-axis label needs; the label stride derives from it. */
 const LABEL_MIN_PX = 44
 /** Below this a per-turn hit column is too thin to aim at; one plot-wide surface takes over. */
@@ -186,6 +221,8 @@ interface ChartTurn {
   total: number
   cats: Record<Category, number>
   isStart: boolean
+  /** The turn's exact prompt text is still held (see PromptAsSentSection). */
+  hasPrompt: boolean
 }
 
 /**
@@ -247,14 +284,14 @@ function StackedArea({
   }, [fixedWidth])
 
   const count = turns.length
-  const plotLeft = MARGIN.left
+  const maxTotal = Math.max(...turns.map(t => t.total), 0)
+  const ticks = niceTicks(maxTotal)
+  const yMax = ticks[ticks.length - 1]
+  const plotLeft = axisGutter(fmtN(yMax))
   const plotRight = Math.max(plotLeft + 1, width - MARGIN.right)
   const plotWidth = plotRight - plotLeft
   const plotTop = MARGIN.top
   const plotBottom = CHART_HEIGHT - MARGIN.bottom
-  const maxTotal = Math.max(...turns.map(t => t.total), 0)
-  const ticks = niceTicks(maxTotal)
-  const yMax = ticks[ticks.length - 1]
   const y = (v: number) => plotBottom - (v / yMax) * (plotBottom - plotTop)
   // A single turn has no run along the x axis, so its band spans the whole plot.
   const xAt = (i: number) => (count === 1 ? (plotLeft + plotRight) / 2 : plotLeft + (i * plotWidth) / (count - 1))
@@ -336,7 +373,7 @@ function StackedArea({
         {ticks.map(v => (
           <g key={v}>
             <line x1={plotLeft} x2={plotRight} y1={y(v)} y2={y(v)} stroke="var(--border)" />
-            <text x={plotLeft - 10} y={y(v) + 4} textAnchor="end" fill="var(--muted)" className="tabular-nums">
+            <text x={plotLeft - TICK_GAP_PX} y={y(v) + 4} textAnchor="end" fill="var(--muted)" className="tabular-nums">
               {fmtN(v)}
             </text>
           </g>
@@ -383,12 +420,27 @@ function StackedArea({
               x={xAt(i)}
               y={plotBottom + 24}
               textAnchor="middle"
-              fill={i === selectedIdx ? 'var(--card-fg, var(--text-strong))' : 'var(--muted)'}
+              // A kept turn's label takes the accent too, so the dot is not the
+              // only cue that its text can be opened below.
+              fill={i === selectedIdx ? 'var(--card-fg, var(--text-strong))' : t.hasPrompt ? 'var(--accent)' : 'var(--muted)'}
               fontWeight={i === selectedIdx ? 600 : 400}
               data-axis-label={t.n}
             >
               {i18nT('pages.contextBreakdown.axis_turn_n', { n: fmtN(t.n) })}
             </text>
+          ) : null,
+        )}
+        {/* A page mark under each turn whose prompt text is still held, so the
+            reader can see which columns the "Prompt as sent" section can open. */}
+        {turns.map((t, i) =>
+          t.hasPrompt ? (
+            // A <title> so the mark decodes where it is hovered, not only via the
+            // legend below the chart. The data attribute keeps its historical
+            // name; tests and the capture harness count it.
+            <g key={`p${t.n}`} data-prompt-dot={t.n}>
+              <title>{i18nT('pages.contextBreakdown.prompt_kept_short')}</title>
+              <PromptMarkGlyph x={xAt(i)} y={plotBottom + 9} />
+            </g>
           ) : null,
         )}
       </svg>
@@ -415,7 +467,10 @@ function StackedArea({
             type="button"
             tabIndex={i === focusIdx ? 0 : -1}
             aria-pressed={i === selectedIdx}
-            aria-label={i18nT('pages.contextBreakdown.turn_button', { n: fmtN(t.n), chars: fmtN(t.total) })}
+            aria-label={i18nT(
+              t.hasPrompt ? 'pages.contextBreakdown.turn_button_prompt' : 'pages.contextBreakdown.turn_button',
+              { n: fmtN(t.n), chars: fmtN(t.total) },
+            )}
             data-turn={t.n}
             className={`absolute inset-y-0 appearance-none bg-transparent border-0 p-0 m-0 cursor-pointer rounded focus-visible:outline focus-visible:outline-2 focus-visible:outline-[var(--accent)] ${
               pointerSurface ? 'pointer-events-none' : 'hover:bg-[var(--card-hl)]'
@@ -437,6 +492,12 @@ function StartTurnRow({ turn, selected, onSelect }: { turn: ChartTurn; selected:
     <button
       type="button"
       aria-pressed={selected}
+      // The dot beside the label is colour-only; the label says the same thing.
+      aria-label={
+        turn.hasPrompt
+          ? i18nT('pages.contextBreakdown.start_row_prompt', { n: fmtN(turn.n), chars: fmtN(turn.total) })
+          : undefined
+      }
       data-turn={turn.n}
       data-start-row
       className={`w-full flex items-center justify-between gap-3 px-3 py-2 mb-2 rounded-lg border text-left text-[13px] cursor-pointer appearance-none bg-transparent focus-visible:outline focus-visible:outline-2 focus-visible:outline-[var(--accent)] ${
@@ -444,7 +505,21 @@ function StartTurnRow({ turn, selected, onSelect }: { turn: ChartTurn; selected:
       }`}
       onClick={() => onSelect(turn.n)}
     >
-      <span>{i18nT('pages.contextBreakdown.start_row', { n: fmtN(turn.n) })}</span>
+      <span className="flex items-center gap-2">
+        {i18nT('pages.contextBreakdown.start_row', { n: fmtN(turn.n) })}
+        {turn.hasPrompt ? (
+          // Said in words, not only a mark: the legend that decodes the mark sits
+          // under the chart, off-screen when this row is what the reader sees.
+          <span
+            className="inline-flex items-center gap-1.5 text-[11px] text-[var(--accent)] shrink-0"
+            aria-hidden="true"
+            data-prompt-dot={turn.n}
+          >
+            <PromptMark />
+            {i18nT('pages.contextBreakdown.prompt_kept_short')}
+          </span>
+        ) : null}
+      </span>
       <span className="font-mono text-[12px] text-muted tabular-nums shrink-0">
         {i18nT('pages.contextBreakdown.turn_button_chars', { chars: fmtN(turn.total) })}
       </span>
@@ -454,7 +529,18 @@ function StartTurnRow({ turn, selected, onSelect }: { turn: ChartTurn; selected:
 
 /** One category of the selected turn: colour dot, name, count, and the raw
  *  blocks behind it as a disclosure. */
-function CategoryRow({ cat, chars, blocks }: { cat: Category; chars: number; blocks: Record<string, number> }) {
+function CategoryRow({
+  cat,
+  chars,
+  blocks,
+  note,
+}: {
+  cat: Category
+  chars: number
+  blocks: Record<string, number>
+  /** A muted aside after the name, e.g. where this total sits in the prompt rows below. */
+  note?: string
+}) {
   const [open, setOpen] = useState(false)
   const name = i18nT(CATEGORY_KEY[cat])
   const parts = Object.entries(groupBlocks(blocks)).sort((a, b) => b[1] - a[1])
@@ -469,8 +555,20 @@ function CategoryRow({ cat, chars, blocks }: { cat: Category; chars: number; blo
       >
         <span className="flex items-center gap-2 min-w-0">
           <i className="w-2.5 h-2.5 rounded-[2px] shrink-0" style={{ background: CATEGORY_FILL[cat] }} aria-hidden="true" />
-          <span className="truncate">{name}</span>
+          <span className="min-w-0 break-words">{name}</span>
           <Chevron size={14} className="lucide-inline shrink-0 text-muted" aria-hidden="true" />
+          {/* What the chevron opens, said as a count: the prompt rows below use
+              the same chevron and open TEXT, and a first-time reader expected
+              text here too. "3 parts" promises sub-counts, not a slice. */}
+          <span className="text-[11px] text-muted shrink-0" data-testid="category-parts">
+            {i18nT('pages.contextBreakdown.category_parts', { count: parts.length })}
+          </span>
+          {/* After the chevron, so the chevron stays the name's own control (it
+              expands this total) and the aside is not read as what it opens.
+              Wraps rather than truncates: the aside ends in the clause that
+              answers the double-count ("counted once there"), and an ellipsis
+              at side-panel width cut exactly that off. */}
+          {note ? <span className="text-[11px] text-muted min-w-0 break-words">{note}</span> : null}
         </span>
         <span className="font-mono text-[12px] text-muted tabular-nums shrink-0">{fmtN(chars)}</span>
       </button>
@@ -493,10 +591,13 @@ function CategoryRow({ cat, chars, blocks }: { cat: Category; chars: number; blo
  *  fabricated trace. */
 export function ContextBreakdownPanel({
   trace,
+  prompts,
   isLoading,
   chartWidth,
 }: {
   trace: ContextTrace | null | undefined
+  /** The session's recorded prompt texts; the section is omitted when absent. */
+  prompts?: PromptTrace | null
   isLoading?: boolean
   /** Fixed chart width in px (capture harnesses and tests); measured when absent. */
   chartWidth?: number
@@ -515,13 +616,21 @@ export function ContextBreakdownPanel({
       </div>
     )
   } else {
-    body = <ContextBreakdownCard trace={trace} chartWidth={chartWidth} />
+    body = <ContextBreakdownCard trace={trace} prompts={prompts} chartWidth={chartWidth} />
   }
 
   return <div>{body}</div>
 }
 
-function ContextBreakdownCard({ trace, chartWidth }: { trace: ContextTrace; chartWidth?: number }) {
+function ContextBreakdownCard({
+  trace,
+  prompts,
+  chartWidth,
+}: {
+  trace: ContextTrace
+  prompts?: PromptTrace | null
+  chartWidth?: number
+}) {
   // `null` follows the newest turn as the trace grows; a number pins a turn the
   // user chose, so a new row arriving does not yank the detail view away.
   const [pinned, setPinned] = useState<number | null>(null)
@@ -531,6 +640,9 @@ function ContextBreakdownCard({ trace, chartWidth }: { trace: ContextTrace; char
     total: turn.total_chars,
     cats: categorise(turn.blocks),
     isStart: turn.phase === 'session_start',
+    hasPrompt: prompts
+      ? promptForTurn(prompts.turns, turn.ts, i > 0 ? trace.turns[i - 1].ts : undefined) !== null
+      : false,
   }))
   // Session-start turns are listed above the chart: one of them is many times
   // the size of any later turn and would pin the y-axis, flattening the rest.
@@ -545,6 +657,14 @@ function ContextBreakdownCard({ trace, chartWidth }: { trace: ContextTrace; char
   const selectedChart = all[selected - 1]
   const previous = selected > 1 ? all[selected - 2].total : undefined
   const delta = deltaText(selectedChart.total, previous)
+  // The developer view of the selected turn's exact text. Undefined `prompts`
+  // means the caller did not fetch it (tests, captures), and the section stays
+  // out; `null`/empty means fetched and nothing recorded, which the section says.
+  const promptRecord = prompts
+    ? promptForTurn(prompts.turns, selectedTurn.ts, selected > 1 ? trace.turns[selected - 2].ts : undefined)
+    : null
+  // A record scanned without a carve has no user row of its own below.
+  const promptUncarved = promptRecord !== null && !promptRecord.spans.some(sp => sp.label === USER_LABEL)
   const select = (n: number) => setPinned(n === newest ? null : n)
 
   const rows = CATEGORIES.map(cat => ({
@@ -592,6 +712,12 @@ function ContextBreakdownCard({ trace, chartWidth }: { trace: ContextTrace; char
                   {i18nT(CATEGORY_KEY[cat])}
                 </span>
               ))}
+              {shown.some(t => t.hasPrompt) || starts.some(t => t.hasPrompt) ? (
+                <span className="flex items-center gap-1.5" data-testid="prompt-kept-legend">
+                  <PromptMark />
+                  {i18nT('pages.contextBreakdown.prompt_kept_legend')}
+                </span>
+              ) : null}
             </div>
             <p className="m-0 mt-2 text-[12px] text-muted">{i18nT('pages.contextBreakdown.pick_hint')}</p>
             <p className="m-0 mt-2 text-[12px] text-muted">
@@ -617,10 +743,41 @@ function ContextBreakdownCard({ trace, chartWidth }: { trace: ContextTrace; char
             {i18nT('pages.contextBreakdown.unit_chars')}
           </span>
         </div>
+        {/* Framed as totals, so the list is not read as a twin of the "Prompt as
+            sent" rows below it: same names, same numbers, different question. */}
+        <p className="m-0 mb-1 text-[12px] font-semibold text-text" data-testid="totals-by-kind">
+          {i18nT('pages.contextBreakdown.totals_by_kind')}
+        </p>
         {rows.map(r => (
-          <CategoryRow key={r.cat} cat={r.cat} chars={r.chars} blocks={r.blocks} />
+          <CategoryRow
+            key={r.cat}
+            cat={r.cat}
+            chars={r.chars}
+            blocks={r.blocks}
+            // An uncarved record folds the message into the request header
+            // below; say so on the total it would otherwise seem to contradict,
+            // carrying the count so the pointer and the total read as one fact.
+            note={
+              r.cat === 'message' && promptUncarved
+                ? i18nT('pages.contextBreakdown.totals_user_uncarved', { n: fmtN(r.chars) })
+                : undefined
+            }
+          />
         ))}
       </div>
+
+      {prompts !== undefined ? (
+        <PromptAsSentSection
+          record={promptRecord}
+          turnChars={selectedTurn.total_chars}
+          userChars={selectedTurn.blocks[USER_LABEL]}
+          dropped={prompts?.dropped ?? 0}
+          evicted={prompts?.evicted ?? false}
+          categoryOf={categoryOf}
+          categoryName={cat => i18nT(CATEGORY_KEY[cat])}
+          displayName={displayName}
+        />
+      ) : null}
 
       <p className="m-0 mx-4 mt-4 mb-4 pt-3 border-t border-border text-[12px] text-muted">
         {i18nT('pages.contextBreakdown.footer')}
@@ -645,6 +802,25 @@ export function ContextBreakdownTab({ slot, subagents }: { slot: string; subagen
     // The trace grows by one row per turn, so a tab left open goes stale.
     refetchInterval: 15_000,
   })
+  // The exact prompt texts behind the newest turns. Same cadence as the trace so
+  // a turn's row and its text arrive together.
+  // Gated on Developer Mode itself, not only on the tab's placement: a Context
+  // tab persisted in the panel strip survives the mode being switched off, and
+  // raw prompt text must stop being fetched and shown the moment it is.
+  const devMode = useDevMode()
+  const { data: prompts, error: promptsError } = useQuery<PromptTrace>({
+    queryKey: ['prompt-trace', slot],
+    queryFn: () => api.telemetryPromptTrace(slot),
+    enabled: !!slot && devMode,
+    refetchInterval: 15_000,
+    // Dropped from the cache the moment no tab shows it. The key is the SLOT
+    // name, and a closed tab's name can be taken by a new session: with the
+    // dashboard's `staleTime: Infinity` a remount would serve the closed
+    // session's prompt text from this cache for a whole poll interval before
+    // the refetch replaced it, undoing the backend's forget-on-close. With no
+    // observer there is no view, and nothing held for one.
+    gcTime: 0,
+  })
 
   return (
     <div className="h-full overflow-auto p-3">
@@ -652,7 +828,24 @@ export function ContextBreakdownTab({ slot, subagents }: { slot: string; subagen
       {/* A failed trace read otherwise rendered as an empty panel. Read-only
           side tab, so the hand-off loses nothing; the poll above retries. */}
       <ErrorNotice message={error ? (error instanceof Error ? error.message : String(error)) : null} askAgent className="mb-3" />
-      <ContextBreakdownPanel trace={data} isLoading={isLoading} />
+      {/* A failed prompt-trace read is its own notice: without it the section
+          simply never appears and the developer cannot tell "not kept" from
+          "could not load". Fixed user-vocabulary text rather than the server's
+          message — "prompt trace unavailable" is the backend's name for it, not
+          the reader's — and the poll above retries. Gated on the mode like the
+          data: the query keeps its last error once `enabled` flips false, and a
+          notice about a section no longer shown would otherwise never clear. */}
+      {/* No hand-off: this tab sits in the side panel beside a chat whose
+          composer may hold an unsent draft that the hand-off's navigation would
+          discard, and the poll above retries on its own, so the notice needs no
+          action. A blind reader also would not press a link that "acts on my
+          behalf" from a diagnostics tab, so the one action went unused. */}
+      <ErrorNotice
+        message={devMode && promptsError ? i18nT('pages.contextBreakdown.prompt_load_failed') : null}
+        className="mb-3"
+        testId="prompt-trace-error"
+      />
+      <ContextBreakdownPanel trace={data} prompts={devMode ? prompts : undefined} isLoading={isLoading} />
     </div>
   )
 }

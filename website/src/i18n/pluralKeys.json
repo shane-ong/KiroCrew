@@ -233,6 +233,8 @@
   "hooks.useNativeNotification.new_notifications",
   "pages.contextBreakdown.scope_turns",
   "pages.contextBreakdown.earlier_hidden",
+  "pages.contextBreakdown.category_parts",
+  "pages.contextBreakdown.prompt_dropped",
   "pages.contextBreakdown.scope_all_turns",
   "components.fileChangeChips.omitted_files_notice",
   "pages.chatSidebar.opened_sessions_count",

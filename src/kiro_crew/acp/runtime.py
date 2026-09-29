@@ -45,7 +45,7 @@ from kiro_crew.acp._dispatch import reject_option_id as _reject_option_id
 from kiro_crew.acp._dispatch import (
     set_mode_params,
 )
-from kiro_crew.acp._frame_record import record_frame
+from kiro_crew.acp._frame_record import record_frame, record_written_frame
 from kiro_crew.acp.client import (
     _apply_pod_home_remap,
     _is_safe_oauth_url,
@@ -4842,7 +4842,8 @@ class AcpRuntime:
             on_reserved(req_id)
 
         req = JsonRpcRequest(method=method, params=params, id=req_id)
-        data = json.dumps(req.to_dict()) + "\n"
+        frame = req.to_dict()
+        data = json.dumps(frame) + "\n"
 
         try:
             # Under the write lock so a response frame waiting behind this
@@ -4851,6 +4852,10 @@ class AcpRuntime:
             async with self._stdin_write_lock():
                 self._refuse_write_if_dead()
                 self._process.stdin.write(data.encode())
+                # Recorded here, the moment the bytes reached the transport and
+                # before the drain, so the capture holds wire order even when
+                # this drain stalls and a cancel is appended unlocked behind it.
+                self._record_written(frame, len(data))
                 await self._process.stdin.drain()
         except AcpRuntimeDead:
             self._routed_requests.pop(req_id, None)
@@ -4883,12 +4888,17 @@ class AcpRuntime:
             # signal that can end a wedged turn: wait for the lock under the
             # no-progress bound, append unlocked if it does not come, and never
             # park on a drain behind a reader that stopped.
+            # Recorded at write time on either path: every outcome puts the
+            # bytes in the transport (they differ in drain evidence), a raise
+            # does not, and an unlocked append lands in the capture AFTER the
+            # frame it was appended behind (see send_request).
             outcome = await write_notification_best_effort(
                 self._process.stdin,
                 self._stdin_write_lock(),
                 data.encode(),
                 bound_secs=_RESPONSE_WRITE_BOUND_SECS,
                 before_write=self._refuse_write_if_dead,
+                after_write=lambda: self._record_written(msg, len(data)),
             )
         except (BrokenPipeError, ConnectionResetError) as exc:
             self._mark_dead(f"pipe broken: {exc}")
@@ -5015,7 +5025,15 @@ class AcpRuntime:
         self._skill_projection_generation = generation
         return True
 
-    async def _write_response_bounded(self, data: bytes, request_id: str | int) -> None:
+    def _record_written(self, frame: dict[str, Any], wire_bytes: int) -> None:
+        """Record an outbound frame whose ``stdin.write`` just returned (see
+        ``_frame_record.record_written_frame``); a restricted session records nothing."""
+        if self.recording_allowed and self._process and self._process.stdin:
+            record_written_frame(self._acp_backend, frame, wire_bytes, self._process.stdin)
+
+    async def _write_response_bounded(
+        self, data: bytes, request_id: str | int, *, after_write: Callable[[], None] | None = None
+    ) -> None:
         """Write a response/error frame under the write lock and a no-progress bound.
 
         Mirror of ``AcpClient._write_response_bounded`` for the shared runtime.
@@ -5038,6 +5056,7 @@ class AcpRuntime:
             data,
             bound_secs=_RESPONSE_WRITE_BOUND_SECS,
             before_write=self._refuse_write_if_dead,
+            after_write=after_write,
         ):
             return
         safe_id = _loggable_request_id(request_id)
@@ -5094,7 +5113,8 @@ class AcpRuntime:
         if projection is not None:
             params = projection.request(method, params)
         req = JsonRpcRequest(method=method, params=params, id=req_id)
-        data = json.dumps(req.to_dict()) + "\n"
+        frame = req.to_dict()
+        data = json.dumps(frame) + "\n"
 
         future: asyncio.Future[dict[str, Any]] = asyncio.get_running_loop().create_future()
         self._pending_requests[req_id] = future
@@ -5107,6 +5127,10 @@ class AcpRuntime:
             async with self._stdin_write_lock():
                 self._refuse_write_if_dead()
                 self._process.stdin.write(data.encode())
+                # Recorded here, the moment the bytes reached the transport and
+                # before the drain, so the capture holds wire order even when
+                # this drain stalls and a cancel is appended unlocked behind it.
+                self._record_written(frame, len(data))
                 await self._process.stdin.drain()
         except AcpRuntimeDead:
             # From _refuse_write_if_dead: _mark_dead already failed or dropped the
@@ -5151,7 +5175,10 @@ class AcpRuntime:
         data = json.dumps(msg) + "\n"
 
         try:
-            await self._write_response_bounded(data.encode(), request_id)
+            # Recorded at write time, inside the bounded writer (see send_request).
+            await self._write_response_bounded(
+                data.encode(), request_id, after_write=lambda: self._record_written(msg, len(data))
+            )
         except (BrokenPipeError, ConnectionResetError) as exc:
             self._mark_dead(f"pipe broken: {exc}")
             raise AcpRuntimeDead(f"pipe broken: {exc}") from exc
@@ -5167,7 +5194,10 @@ class AcpRuntime:
         data = json.dumps(msg) + "\n"
 
         try:
-            await self._write_response_bounded(data.encode(), request_id)
+            # Recorded at write time, inside the bounded writer (see send_request).
+            await self._write_response_bounded(
+                data.encode(), request_id, after_write=lambda: self._record_written(msg, len(data))
+            )
         except (BrokenPipeError, ConnectionResetError) as exc:
             self._mark_dead(f"pipe broken: {exc}")
             raise AcpRuntimeDead(f"pipe broken: {exc}") from exc
@@ -7898,7 +7928,8 @@ class AcpRuntime:
         if projection is not None and translate:
             params = projection.request(method, params)
         req = JsonRpcRequest(method=method, params=params, id=req_id)
-        data = json.dumps(req.to_dict()) + "\n"
+        frame = req.to_dict()
+        data = json.dumps(frame) + "\n"
 
         loop = asyncio.get_running_loop()
         future: asyncio.Future[dict[str, Any]] = loop.create_future()
@@ -7908,6 +7939,10 @@ class AcpRuntime:
             async with self._stdin_write_lock():
                 self._refuse_write_if_dead()
                 self._process.stdin.write(data.encode())
+                # Recorded here, the moment the bytes reached the transport and
+                # before the drain, so the capture holds wire order even when
+                # this drain stalls and a cancel is appended unlocked behind it.
+                self._record_written(frame, len(data))
                 await self._process.stdin.drain()
         except AcpRuntimeDead:
             # Reached only through _refuse_write_if_dead: _mark_dead has already

@@ -279,6 +279,7 @@ async def write_response_frame_bounded(
     *,
     bound_secs: float,
     before_write: Callable[[], None] | None = None,
+    after_write: Callable[[], None] | None = None,
 ) -> bool:
     """Write one response/error frame under the transport's write lock and a
     no-progress bound on BOTH waits -- for the lock and for the drain.
@@ -287,6 +288,10 @@ async def write_response_frame_bounded(
     may raise to abort the write -- the shared runtime uses it to re-check that
     it was not marked dead while this caller waited for the lock, so no frame
     is written into a pipe whose owner has already been torn down.
+    ``after_write`` runs synchronously the moment ``stdin.write`` returned,
+    before the drain is awaited -- the frame recorder's hook, so the outbound
+    capture holds frames in the order they hit the pipe rather than the order
+    their drains completed.
 
     Waiting for the lock is waiting for the previous frame's drain: a
     flow-control-paused writer holding a multi-MB prompt is a live reader as
@@ -310,6 +315,8 @@ async def write_response_frame_bounded(
         if before_write is not None:
             before_write()
         stdin.write(data)
+        if after_write is not None:
+            after_write()
         return await await_under_no_progress_bound(stdin.drain(), stdin, bound_secs=bound_secs)
     finally:
         lock.release()
@@ -334,6 +341,7 @@ async def write_notification_best_effort(
     *,
     bound_secs: float,
     before_write: Callable[[], None] | None = None,
+    after_write: Callable[[], None] | None = None,
 ) -> str:
     """Write a fire-and-forget notification (``session/cancel``) without letting
     the write lock swallow it.
@@ -348,7 +356,9 @@ async def write_notification_best_effort(
     the caller's log line: ``"drained"`` (written and drained under the lock),
     ``"appended_unlocked"`` (the lock did not come; the frame sits in the
     transport's buffer with no drain observed), or ``"stalled"`` (the locked
-    drain made no progress). Pipe errors propagate.
+    drain made no progress). Pipe errors propagate. ``after_write`` runs
+    synchronously after ``stdin.write`` returned on either path, before any
+    drain (see ``write_response_frame_bounded``).
     """
     acquire: asyncio.Future[bool] = asyncio.ensure_future(lock.acquire())
     try:
@@ -361,11 +371,15 @@ async def write_notification_best_effort(
         if before_write is not None:
             before_write()
         stdin.write(data)
+        if after_write is not None:
+            after_write()
         return "appended_unlocked"
     try:
         if before_write is not None:
             before_write()
         stdin.write(data)
+        if after_write is not None:
+            after_write()
         drained = await await_under_no_progress_bound(stdin.drain(), stdin, bound_secs=bound_secs)
         return "drained" if drained else "stalled"
     finally:

@@ -1094,6 +1094,339 @@ indistinguishable `404` (`code: not_found`) and the refusal is SEL-audited
 (deny-by-default, App Kit §5.2) — an app that needs its own turns' billing has
 `/api/usage/turns`.
 
+The whole Context tab (`ContextBreakdownTab`, chart and prompt section alike)
+is a lazy `import()` boundary in `ActivityViewer` — a Developer-Mode-only
+view most sessions never open, kept out of the App chunk the way the share
+modal is, which is what keeps that chunk under its bundle-size budget. Its
+`Suspense` fallback is the tab's own "Loading context breakdown…" line, not
+`null`: on a slow link the first open would otherwise show a blank panel that
+reads as "nothing here".
+
+The selected turn's category rows are headed "Totals by kind", so they are not
+read as a twin of the "Prompt as sent" rows beneath them (same names, same
+numbers, a different question), and each total's chevron is followed by what it
+opens, as a count ("3 parts", `category_parts`): the prompt rows beneath use the
+same chevron and open TEXT, and a first-time reader expected text here too; when
+the selected record was scanned
+uncarved, the "Your message" total carries the aside "· its {{n}} characters sit in
+the message wrapper below, counted once there" (the count rides in the pointer,
+and the counting statement lives here and only here, so the total and the
+message-wrapper row — whose NAME carries the claim, "Message wrapper (built-in)
++ your message" (`prompt_name_plus_your_message`), with the arithmetic against
+the row's own count as the aside, "{{n}} of its {{total}} characters are your
+message": the claim in the name because a reader given it only as a trailing
+clause still read 42 on carved turns and 96 here as "the same piece measured two
+ways", and the name is what explains the larger total before any aside is read;
+and the arithmetic rather than a bare count because a reader who saw the number
+in the totals row too read "includes your 54-character message" beside a row
+total of 96 as the same thing listed twice with different sizes, and a suffix
+that carried the counting statement as well read as two places saying both
+things (the same count, from the usage row, so neither has to be subtracted
+from the other) read as one fact; "sit in",
+not "open": the row's chevron opens the total, it does not jump anywhere; the
+aside and the name wrap rather than truncate, because at side-panel width an
+ellipsis cut off exactly the counting clause the aside exists to deliver; the
+chevron sits right after the name and the aside after the chevron, so the aside
+is not read as what the chevron opens), so
+the two lists do not read as counting one thing two ways. Those two places —
+the total it would otherwise contradict and the row that holds the text — are
+the whole telling: the helper under the heading is one sentence for both scans
+("The same pieces as above, in the order they were sent."), because a third
+statement of the same fact on one screen read as repetition.
+A failed prompt-trace read shows a fixed user-vocabulary notice ("Couldn't load
+this session's prompt text. It retries automatically; the section appears when
+it loads." — the last clause so a reader knows how recovery will show), never the server's
+message, and carries no "Ask the agent" hand-off: the tab sits beside a chat
+whose composer may hold an unsent draft the hand-off's navigation would discard,
+the poll retries on its own, and a blind reader would not press a link that
+"acts on my behalf" from a diagnostics tab.
+One term per meaning: "available" is the per-turn, viewable sense (the mark's
+legend "Prompt text available · open below", the marks' title and the turn
+aria-labels), "kept" is reserved for held-until-restart.
+
+**Prompt as sent (`prompt-trace`).** The size breakdown answers "how much"; the
+Developer-Mode companion under the selected turn's detail answers "what": the
+exact text the turn handed the agent transport, one disclosure row per block
+with the raw slice behind it — each row prefixed, in muted text, with the name
+of the summary band it belongs to ("Rules you set · Must-follow rules"), so the
+two lists share one vocabulary — a segment bar in reading order, a one-line
+helper (shown only when a record exists) saying these are the same pieces as the
+breakdown above in the order they were sent (the bar carries the title "The
+pieces below, to scale", since a thin unlabeled bar read as decoration), and a
+Copy-all button. The user's
+message ordinarily has a row of its own (`your_message`, carved as below); when
+a record was scanned without a carve, the helper adds — in explicit contrast
+with the summary above, which still lists the message on its own row — that
+here the message is counted inside the request header's total so it has no row
+of its own below, and the request-header row itself is named "… + your
+message" (`hasUserRow` picks between the two). The footer says the text is
+"held" in memory while the legend says "Prompt text available" — one word per
+sense (available = readable now; held = ephemeral), so neither points two ways —
+and
+the copy-failure notice names the in-place recovery ("Open a piece below and
+copy its text"). A block that appears more than once in one prompt
+(the reply-format rules sit at both ends by design) gets an ordinal on its row
+("Reply format rules · 1 of 2"). The text comes from `kiro_crew.prompt_trace`,
+a process-memory ring of the newest `MAX_TURNS_PER_SESSION` (12) prompts per
+session, each kept to at most `MAX_CHARS_PER_TURN` (2M) characters from its
+start with the record saying when it was cut (`truncated`; `chars` stays the
+length as sent, and the tab prints "Only the first N characters are kept
+here … The pieces below cover only that kept part." ABOVE the segment bar,
+beside the helper, because the rows below sum to the kept text while the
+heading and the "Totals by kind" list name the whole prompt — without the last
+clause a reader met "Your message 2,500,054" above "Your message 54" and could
+not tell a trimmed copy from a wrong turn; the assembled-vs-sent note sits in the
+same place for the same reason — a reader who met "Rules you set 1,220" above a
+408 row below filed the gap under "could not tell" before reaching a note placed
+after the rows). The cut lands on
+whitespace, never inside a token: redaction runs on read and its credential
+patterns match whole tokens against length floors, so a fixed-offset cut through
+a credential would retain a prefix nothing can match and serve it with
+`redacted=false`; `_cut_point` moves the cut back to the last whitespace within
+`TRUNCATION_LOOKBACK` (64K) characters of the cap, and a whitespace-free run
+longer than that window is cut at the window's start (a token that long has no
+boundary the redactor could use either way, and the window bounds both the
+search and the readable text the boundary can cost). All of it sits under a
+global `MAX_TOTAL_CHARS` budget of 16M characters (16–64 MB of Python string,
+one to four bytes per code point by the widest character each string holds;
+least recently written session evicted whole, never the one just written; a
+lone session still over the budget sheds its oldest records — counted in
+`dropped` like a cap push-out — down to its newest prompt, so only a single
+prompt larger than the whole budget may exceed it).
+Recording is always on for persistent sessions and has no operator switch: the
+ceiling is the deliberate trade, sized for the reader rather than the host, so
+a gateway on which nobody opens Developer Mode pays at most that much. Only
+sessions a Context tab can resolve are recorded at all
+(`prompt_trace.readable_session_key`: the `dashboard:` namespace and the
+channel namespaces in `constants.CHANNEL_SESSION_NAMESPACES`); a cron, hook or
+subagent key has no reader, so recording it would only spend the shared budget
+and, under LRU-by-write eviction, push out the idle dashboard session a
+developer is actually reading. The store is bounded in the dimensions text
+volume does not cover too, because `forget` is only ever called by the
+dashboard's close and sweep paths and a channel session with no tab open would
+otherwise leave its key behind for the gateway's lifetime: at most `MAX_SESSION_KEYS` (1024) sessions are held at
+once (least recently written evicted whole, like the character budget), the
+table of evicted keys is bounded by the SAME constant (one population, so the
+two bounds cannot drift), and a key longer than `MAX_RETAINED_KEY_CHARS` (256)
+is held under its SHA-256 at every door — record, snapshot and forget resolve
+through one `_store_key`, the shape `runtime_death._store_key` set. Both
+bounds are said out loud: each ring counts the prompts its own cap pushed out
+and a session that was evicted is remembered by key, so
+the payload's `dropped` / `evicted` let the tab tell "truncated" and "evicted
+to make room" apart from "never recorded" and "gone with a restart", fed by both providers' `stream()`
+through `EssentialDelivery.stream(on_accepted=...)` — fired once the transport
+has demonstrably taken the prompt (its first event, or a completion with none)
+and never when the send raised, so a prompt the pipe refused is never shown as
+sent; on the shared-runtime backend the outer `AcpProvider.stream` announces
+`len(message)` (`_announce_outbound_prompt`) before handing the message to its
+delivery, so no pre-send hook is needed — so what is recorded is the
+string AFTER the receipt substitution, i.e. what `build_prompt_blocks` wraps
+into the `session/prompt` text block. It is never written to disk (a gateway
+restart empties it; the opt-in wire recorder in `acp/_frame_record.py` is the
+durable capture), a restricted (incognito / temporary) session records nothing
+(the same gate the wire recorder applies), and closing or sweeping a tab calls
+`prompt_trace.forget` for its `dashboard:` session — unless another live slot
+still resolves to that session key (a linked tab), in which case the survivor
+keeps its view — so a closed session's text is not servable either. That call
+sits OUTSIDE the close's ownership re-check: a recreate that took the slot name
+during the save but is linked elsewhere runs on a different session key, so the
+original's text is still dropped rather than left for the next unbound tab of
+that name to display; only a replacement on the SAME key keeps it. A
+channel-born slot's effective key IS the channel's (`slack:<ts>`), and that
+conversation outlives the tab that showed it, so closing such a tab forgets
+nothing: the channel's prompts stay until the ring's own bounds evict them. The ring is keyed by the SESSION the turns ran on
+(`dashboard:<slot>` for an ordinary tab, the channel key for a linked one);
+`handlers/telemetry.py::api_prompt_trace` takes the SLOT name the tab knows
+itself by (`GET /api/telemetry/prompt-trace?slot=<slot>`, `400` without one)
+and resolves it through the live slot's `effective_session_key`, or
+`session_key_for` when no slot is live. Dashboard-only, with the same
+indistinguishable `404` + SEL audit for an app caller as `context-trace`, and
+for a stronger reason: the payload carries memory, lessons and skill text
+verbatim — which is why the READ is a registered redaction egress
+(`security_posture._REDACTION_SINKS`, "Prompt as sent"): the ring keeps the
+prompt as sent, a prompt carries the user's memory and recall bodies that no
+write path scrubs, so `PromptRecord.presented` runs the WHOLE text through
+the shared exfiltration-URL then credential chain — never block by block: the
+chain's private-key rule masks from a BEGIN marker through its END marker
+across anything between, so a key whose body crossed a block boundary would,
+scrubbed per block, keep every byte of the block holding the END, which has no
+BEGIN of its own — and rebuilds the block spans by scanning the scrubbed text
+(redaction changes lengths and the chain reports no offsets, and a redaction
+that swallowed a block marker has changed the block structure of what is
+served; a redaction tag is not a block marker, so an untouched block keeps its
+span and a consumed one is simply absent; the user's carve is kept only when
+the three pieces scrubbed apart re-join to the whole, i.e. no redaction crossed
+its bounds), and `to_dict` never serves the raw string. The row carries `redacted`, and the tab
+then says "Passwords, keys and suspicious links are masked in this view; the AI
+received the original. The counts below measure the masked text, and Copy all copies it." — the middle clause because two numbers for one thing (the totals row sized from the original, the rows from the masked text) read as a bug and a reader could not say which number was which, and the last because the button sits beside the note and a reader would not use it without knowing which text it copies (the served text is the only text the browser has, so the masked one). Each turn carries its `spans` — `(start, end, label)`
+from `context_blocks.block_spans`, the scan function `split_blocks` sums for the
+usage rows — the same function over a different input (the text as sent:
+receipt-substituted, capped, uncarved when no span was announced) rather than the
+assembled prompt, so a boundary is found the same way in both views while the
+covered text can differ, which is what the assembled-vs-sent and truncated notes
+say per case — adjacent same-label spans coalesced at the source (a block body
+and the blank line after its closer, or a run of repeated one-line markers,
+become one span, which is what the view draws anyway), and cached on the
+immutable record after its first read so a poll re-serves rather than re-scans,
+but only while the cache costs no more than the text it describes
+(`SPAN_COST_CHARS` = 128 characters per retained tuple, measured): the ring's
+budget counts text, so a nested container that could outgrow it would sit
+outside every stated bound — with this line, everything the ring retains is
+bounded by twice `MAX_TOTAL_CHARS`, and a span-dense record (alternating
+one-line markers, ~137K spans per 2M characters) is re-scanned per read
+instead of cached. The presented form is deliberately NOT a
+cached copy — a retained scrubbed string would double what the ring holds
+outside the `total_chars` budget — so only the verdict (`_needs_redaction`,
+taken by the first read from the same pass that produced its presentation, so
+no read scrubs a record twice) is cached: the ordinary record is served as the
+very string held, and the rare record with something to scrub is scrubbed once
+per read, off the loop; the whole body, spans and text, is `json.dumps`-ed AND UTF-8-encoded on the
+worker thread and returned as prebuilt bytes in a `web.Response`, because
+`json_response` (or a `Response(text=...)`) would serialize or encode up to
+`MAX_TURNS_PER_SESSION` × `MAX_CHARS_PER_TURN` of text on the event loop at
+every poll. On the browser side the query is `gcTime: 0`: the cache key is the
+SLOT name, and a closed tab's name can be taken by a new session, so under the
+dashboard's `staleTime: Infinity` a remount would otherwise serve the closed
+session's text from the client cache for a whole poll interval before the
+refetch replaced it — undoing the forget-on-close above. With no tab observing
+the query there is nothing held for one.
+The scan is carved at the user's own span the way the size breakdown is,
+because that span is the one part of a prompt the scan must not trust: a
+message with a line starting `[Memory ` would otherwise read as a memory block
+and swallow every genuine block after it. The dashboard runner knows the exact
+span (the same `_span_arg` it sizes with) and says so with
+`prompt_trace.announce_user_span(full_message, span)` right before
+`client.stream(full_message)`; the provider's `record`, on the same task a
+moment later, re-finds it in the text it is given — the receipt substitution in
+between may have moved it by one length delta, so the two candidate positions
+are "unmoved" and "moved by the delta", and either is accepted only when the
+slice still has the announced text's length and digest, never on position alone
+(the announcement retains the text as a length and a 16-byte BLAKE2b digest, not
+the text itself: it is held on the task outside the ring's character budget, and
+a verbatim copy of a large message there would sit outside every stated bound)
+— and keeps it
+on the record (`PromptRecord.user_span`), clamped to the kept prefix when the
+prompt was cut. A `ContextVar` carries the announcement rather than a
+per-session table, since the runner's and the provider's spellings of the
+session key need not match and the value dies with the task; one announcement
+serves one `record`, consumed whether or not it was re-found, so a stale one
+cannot carve a later prompt. A prompt recorded with no announcement (a provider
+driven outside the dashboard runner) is scanned uncarved, and the panel then
+says so as above. The panel matches a prompt to a trace
+turn by TIME, which is the chosen level of the join: the usage row carries no
+turn identifier the prompt record could share, and stamping both writers with a
+per-session sequence is a usage-row schema change deferred to its own PR
+(`promptForTurn`: the newest record stamped at or before the
+turn's usage row and after the previous turn's row, compared as instants so a
+local-offset row still finds its UTC prompt; a failed turn is skipped rather
+than credited to its successor — and the section says so, printing the prompt's
+own send time in the footer (with the sent size only when it differs from the
+heading's number — the same figure a third time reads as a new one — and then
+as "N characters sent" (`prompt_chars_sent`): `chars` is the length as sent,
+before any cut, so "kept" would be wrong on a truncated turn, where the kept
+figure is the truncated note's; and a bare "characters" read as a third
+quantity beside the built and sent counts in the notes above; and not at all
+while the wrong-match warning shows, which already names both numbers — a third
+figure there left a reader with "no idea which number to believe"; and under that
+warning the footer also drops its two claims, "Matched to this turn by time" and
+"The exact text this turn sent", keeping only the send time and where the text
+lives (`prompt_footer_unmatched`): those claims are exactly what the warning says
+may be wrong, and both under it read as "one says trust it, one says maybe
+don't") so a reader can
+cross-check the join, and
+warning in the danger colour when the record's `assembled_chars` differs from
+the selected turn's `total_chars`. `assembled_chars`, not `chars`: the usage
+row is measured from the prompt as the assembler handed it over, and
+`EssentialDelivery.stream` then substitutes the essentials receipt envelope —
+its native form, or nothing at all once acknowledged — before the transport
+write, so on a member session in its steady state the text SENT is shorter
+than the text SIZED on every turn. `on_accepted` therefore reports both the final
+text and the arrival length, the record keeps `chars` (sent) beside
+`assembled_chars` (sized) — on the shared-runtime backend the OUTER
+`AcpProvider`'s delivery is the one that substitutes while the INNER
+`AcpSessionProvider` is the one that records, so the outer hands its arrival
+length across with `prompt_trace.announce_assembled_chars` (a `ContextVar`
+consumed by the next `record` on the task, the user-span announcement's
+shape), called from `AcpProvider.stream` with `len(message)` before its own
+delivery substitutes anything, instead of the inner measuring the
+already-substituted text — the join
+is checked against the sized number, and
+when the two differ the section prints one neutral line saying which is which
+(`prompt_assembled_vs_sent`) instead of a warning; the spans are a scan of the
+sent text, which is what the rows show. The three notes that can sit under the
+rows each open with their verdict, because a reader met three differently
+styled size notes and could not tell the error from the normal cases: the
+danger-coloured one — an inline `ErrorNotice` (icon + alert shape, the same as
+the copy-failure notice), placed ABOVE the segment bar like the truncated note,
+because three same-shaped footnotes differing only by colour read as twins and a
+reader met the warning only after the suspect rows — opens "Likely a wrong match:" and then names the number to
+distrust first — "this text belongs to a M-character prompt, but this turn's
+breakdown counted N, so it may belong to another turn" (each number says what it
+IS in plain words: the text's own prompt size, the turn's breakdown total; the
+word "prepared" was tried for both and read as jargon meaning two things, so no
+note uses it — the assembled-vs-sent line says "built at … characters, … sent",
+the truncated line says "kept") — and names the next step ("Pick a neighbouring
+turn to find its text."), two sentences in all: a rationale sentence between
+them was tried and a reader lost the numbers in it, the two grey
+ones (assembled-vs-sent, truncated) open "Not an error:", and the
+assembled-vs-sent line leads with its cause and names the effect, not the
+mechanism — "a part the AI had already seen was skipped, so the text below holds
+M of the N characters built; nothing was lost" — rather than the module's own
+vocabulary, so it is not mistaken for the wrong-match warning, which is also
+"two numbers disagree"; the smaller number is never called "sent", because the
+headline above already uses that word for the assembled size), and the
+`request_header` block has a task name in the catalog ("Message wrapper
+(built-in)", `block_request_header`) rather than the humanised id, since the
+uncarved notes point a reader at it by name, draws an accent page mark — a small
+page with two text lines (`PromptMarkGlyph`), not a filled dot, because a dot
+under a column read as a second selection marker beside the chart's own ring and
+dashed line, and the one cue saying which turns can still be opened must not
+look like "which turn is picked" — with an SVG `<title>` reading "prompt text
+available", so it decodes where it is hovered, under every chart column
+(and beside a session-start row, whose button then carries a "prompt text
+kept" label as well) whose text is still held and tints that column's axis
+label with the accent, adds a "Prompt text available · open below" legend entry when any is, and says plainly when the selected turn has
+none — with a distinct line when the whole session was evicted, and a
+"Newest turns only: prompt text for N earlier turns of this session was trimmed
+to make room for them" line when the ring has dropped some — "trimmed" for the
+per-session cap, "removed" for the whole-session eviction, because one verb for
+both read as one rule where there are two. Each of the three text-gone notes
+leads with its consequence, which is what tells them apart: "Not coming back:"
+(this turn's text, older than the ring or before a restart), "Newest turns
+only:" (the per-session cap; a plural key, since the first and commonest
+non-zero value is exactly one dropped turn), "Back with this session's next
+turn:" (the whole-session eviction). The session-start row's mark
+is the mark plus the words "prompt text available" (`prompt_kept_short`), not a bare
+mark with a tooltip, since the legend that decodes a mark sits under the chart
+and is off-screen when that row is what the reader sees. The three loss lines each name their object (this turn / this
+session's earlier turns / all of this session's text), because "kept" alone
+read as one word for three different losses. The chart's y-axis gutter
+(`axisGutter`) widens past its fixed margin when the top tick's label would not
+fit, since prompt sizes cross seven digits routinely at this cap and a label
+clipped to ",000,000" reads as a broken chart. The
+reply-format and `[RUNTIME]` blocks carry catalog names of their own ("Reply
+format (built-in)", "Interface in use (built-in)") so "rules" does not name
+two different sources in one list. Span offsets arrive in code points (what the backend's scan counts) and one
+served span is one row — the backend coalesces adjacent same-label spans before
+serving (`_coalesce`), and the view does NOT merge again, since two spellings of
+one rule had already drifted in what they said about each other; segments are
+sized in code points, so every count on the panel shares one unit, and only then
+re-addressed to UTF-16 indices (`spansToUtf16`) for
+`slice`, so a prompt holding an emoji or another non-BMP character neither
+starts every later block a unit late nor over-counts its size. Copy-all goes through the shared
+`copyToClipboard` helper (async clipboard, then the `execCommand` fallback a
+plain-HTTP remote gateway still has); a copy that reached neither is an
+`ErrorNotice` (inline, dismissable, no hand-off) under the heading — cleared
+when the selected record changes, since the section re-renders in place on a
+turn click and a failure belongs to the turn it happened on — and the
+button itself only ever says what succeeded.
+The prompt-trace query and the section are both gated on `useDevMode()` as
+well as on the tab's placement, so a Context tab persisted in the panel strip
+stops fetching and showing raw text the moment Developer Mode is switched off.
+The section is rendered only once the prompt trace has loaded (`prompts`
+undefined omits it), so a loading tab never flashes the empty state; a failed
+prompt-trace read is surfaced as its own `ErrorNotice` beside the trace's.
+
 **Row-timestamp parsing has one owner.** `usage._parse_row_dt` is the single
 spelling for reading a stored row timestamp (`Z` rewritten to `+00:00` for
 py3.10's `fromisoformat`; a naive stamp left naive so a caller's
