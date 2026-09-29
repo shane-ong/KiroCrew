@@ -17,6 +17,22 @@ function openEditor() {
   return screen.getByLabelText('Edit queued message') as HTMLTextAreaElement
 }
 
+describe('QueueStack quoting entry', () => {
+  it('previews and edits what the user typed; the quote block goes back on the head when the edit commits', () => {
+    const quote = { role: 'assistant' as const, text: 'the quoted reply', ts: 't0' }
+    const block = '> the quoted reply\n> — quoting an earlier message from the assistant'
+    const onEdit = vi.fn()
+    render(<QueueStack messages={[{ role: 'queued', content: `${block}\n\nwhy though?`, cls: '', ts: 't', meta: { queueId: 'q1', quote } }]} onCancel={() => {}} onEdit={onEdit} />)
+    expect(screen.getByText('why though?')).toBeInTheDocument()
+    expect(screen.queryByText(/quoting an earlier message/)).not.toBeInTheDocument()
+    const input = openEditor()
+    expect(input.value).toBe('why though?')
+    fireEvent.change(input, { target: { value: 'why not?' } })
+    fireEvent.keyDown(input, { key: 'Enter' })
+    expect(onEdit).toHaveBeenCalledWith('q1', `${block}\n\nwhy not?`)
+  })
+})
+
 describe('QueueStack inline edit', () => {
   it('commits a real change on Enter', () => {
     const onEdit = vi.fn()

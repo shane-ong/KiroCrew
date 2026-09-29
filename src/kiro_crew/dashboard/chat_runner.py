@@ -111,6 +111,7 @@ from kiro_crew.dashboard.chat_delivery import (
     find_written_steer_row,
     queue_entry_is_user_origin,
     queued_text_for_display,
+    quote_meta,
 )
 from kiro_crew.dashboard.chat_folders import (
     _resolve_folder_steering_dirs,
@@ -8462,11 +8463,13 @@ def _requeue_unconsumed_steers(state: "DashboardState", slot: "_ChatSlot") -> No
                 "ts": datetime.now(timezone.utc).isoformat(),
                 "queue_id": qid,
             }
-            # The requeued steer's attachment lists were folded into `_meta`
-            # above; the card drawn from this frame is what a cancel restores.
-            _push_attachments = attachment_meta(_meta)
-            if _push_attachments:
-                _push["meta"] = _push_attachments
+            # The requeued steer's attachment lists and quote were folded into
+            # `_meta` above; the card drawn from this frame is what a cancel
+            # restores, and a frame without the quote would show the raw
+            # blockquote as text until a reload.
+            _push_meta = {**attachment_meta(_meta), **quote_meta(_meta)}
+            if _push_meta:
+                _push["meta"] = _push_meta
             state.broadcast_ws("queue_push", _push)
         except Exception:
             # Broadcast is best-effort — the message is already safely in the
@@ -9432,9 +9435,13 @@ async def _start_next_queued_turn(
             # a real user row, and this flag correctly says "rebuild").
             "drain_writes_row": is_cron or is_subagent or is_recovery or is_app_message,
         }
-        _pop_attachments = attachment_meta(item.get("meta"))
-        if _pop_attachments:
-            _pop["meta"] = _pop_attachments
+        # The client rebuilds the drained entry as a user row from this frame
+        # alone (no `chat_message` echo follows for a user row), so the lists
+        # AND the quote ride it: without the quote the rebuilt row shows the
+        # blockquote as text until a reload.
+        _pop_meta = {**attachment_meta(item.get("meta")), **quote_meta(item.get("meta"))}
+        if _pop_meta:
+            _pop["meta"] = _pop_meta
         state.broadcast_ws("queue_pop", _pop)
         _remove_queued_by_id(slot.messages, item["id"])
 
