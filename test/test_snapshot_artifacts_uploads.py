@@ -372,6 +372,146 @@ class TestAnEmptyLibraryDoesNotVetoTheWholeRestore:
         assert (home / "artifacts" / "kept.md").is_file(), out
         assert (home / "artifacts" / "imported.md").read_text() == "saved while the restore ran"
 
+    def test_rollback_leaves_a_later_tree_the_restore_never_mutated(
+        self, tmp_path, monkeypatch, capsys
+    ):
+        """A saved rollback copy is not ownership of a target the mutation never reached.
+
+        Both present trees are saved in phase one.  The artifact replacement fails before
+        the uploads pass starts, after a dashboard upload lands.  Recovery must restore the
+        artifact tree it removed without replacing uploads from its older phase-one copy.
+        """
+        home = _home(tmp_path, monkeypatch)
+        bundle = _snapshot(tmp_path, "artifacts", "uploads")
+        real_copytree = snap._copytree_safe
+        failed = False
+
+        def fail_artifacts_after_upload(src, dst, **kwargs):
+            nonlocal failed
+            if Path(dst) == home / "artifacts" and not failed:
+                failed = True
+                (home / "uploads" / "concurrent.bin").write_bytes(b"arrived during restore")
+                raise OSError("disk full")
+            return real_copytree(src, dst, **kwargs)
+
+        monkeypatch.setattr(snap, "_copytree_safe", fail_artifacts_after_upload)
+        rc = _restore(bundle, "replace", "artifacts", "uploads")
+        out = capsys.readouterr().out
+
+        assert rc == 1, out
+        assert (home / "artifacts" / "report.md").read_text() == "# quarterly report\n"
+        assert (home / "uploads" / "concurrent.bin").read_bytes() == b"arrived during restore"
+
+    def test_rollback_restores_a_locked_document_committed_before_an_interrupt(self, tmp_path):
+        """A committed locked-document mutation is put back on rollback.
+
+        The rollback marker (`installed`) is set by `mark_committed` INSIDE the store's
+        lock, immediately after the replace commits. So a replace that interrupted AFTER a
+        locked document was replaced -- the live roster already changed, a complete saved
+        copy on disk -- reaches recovery with the marker set, and the saved copy must go
+        back. Driven through the real `crew_teams.install_document` so the save-then-commit
+        ordering and the marker are the production ones, then straight at
+        `_restore_everything_from_rollback` with the marker that call recorded.
+        """
+        from kiro_crew import crew_teams, snapshot_restore
+
+        rel = "crew-teams/teams.json"
+        mc = tmp_path / "home"
+        store = mc / "crew-teams"
+        store.mkdir(parents=True)
+        before = json.dumps({"version": crew_teams.TEAMS_SCHEMA_VERSION, "teams": []})
+        (store / "teams.json").write_text(before)  # the live roster before the restore
+
+        src = tmp_path / "bundle" / rel
+        src.parent.mkdir(parents=True)
+        src.write_text(json.dumps({"version": crew_teams.TEAMS_SCHEMA_VERSION, "teams": []}))
+
+        backup = tmp_path / "pre-restore"
+        installed: set[str] = set()
+        # The production mutation step: save the live copy inside the lock, commit the
+        # replace, THEN mark it committed -- exactly the call the restore phase makes.
+        crew_teams.install_document(
+            src,
+            store,
+            save_existing=snapshot_restore._save_locked_document_to(backup, rel),
+            mark_committed=lambda: installed.add(rel),
+        )
+        assert rel in installed, "mark_committed did not record the committed mutation"
+        assert (backup / rel).read_text() == before, "the pre-restore roster was not saved"
+        # Interrupt lands here. Recovery runs with the marker set -> restore the saved copy.
+        failed = snapshot_restore._restore_everything_from_rollback(backup, mc, [rel], installed)
+        assert failed == [], failed
+        assert (store / "teams.json").read_text() == before, "the committed roster was not put back"
+
+    def test_rollback_leaves_an_uncommitted_locked_document_and_its_concurrent_edit(
+        self, tmp_path, monkeypatch
+    ):
+        """An interrupt BEFORE the commit must not overwrite a concurrent team edit.
+
+        The rollback copy is published inside the lock BEFORE the document is replaced. If
+        the replace is interrupted after that publish but before it commits, the live
+        document was never changed -- and a team edit can land in that window. Gating
+        recovery on the saved copy's mere presence would then overwrite that live edit with
+        the stale saved copy. The committed marker is not set on this path, so recovery
+        must leave the live document (the concurrent edit) exactly as it stands.
+
+        The commit is failed by making `_write_document` raise after `save_existing` has
+        already published the copy; the live document on disk at that point stands in for
+        the state a concurrent writer would have left.
+        """
+        from kiro_crew import crew_teams, snapshot_restore
+
+        rel = "crew-teams/teams.json"
+        mc = tmp_path / "home"
+        store = mc / "crew-teams"
+        store.mkdir(parents=True)
+        before = json.dumps({"version": crew_teams.TEAMS_SCHEMA_VERSION, "teams": []})
+        (store / "teams.json").write_text(before)  # the live roster the save captures
+
+        concurrent = json.dumps(
+            {
+                "version": crew_teams.TEAMS_SCHEMA_VERSION,
+                "teams": [{"id": "edited00edit", "name": "edited", "members": []}],
+            }
+        )
+
+        src = tmp_path / "bundle" / rel
+        src.parent.mkdir(parents=True)
+        src.write_text(json.dumps({"version": crew_teams.TEAMS_SCHEMA_VERSION, "teams": []}))
+
+        backup = tmp_path / "pre-restore"
+        installed: set[str] = set()
+
+        real_write = crew_teams._write_document
+
+        def fail_the_commit(path, teams):
+            # The save has already published `before` to the rollback dir; a team edit now
+            # lands in the window before the replace commits, then the commit is interrupted.
+            (store / "teams.json").write_text(concurrent)
+            raise OSError("disk full after the save was published, before the replace committed")
+
+        monkeypatch.setattr(crew_teams, "_write_document", fail_the_commit)
+        try:
+            crew_teams.install_document(
+                src,
+                store,
+                save_existing=snapshot_restore._save_locked_document_to(backup, rel),
+                mark_committed=lambda: installed.add(rel),
+            )
+        except OSError:
+            pass
+        finally:
+            monkeypatch.setattr(crew_teams, "_write_document", real_write)
+
+        assert rel not in installed, "the marker was set despite an uncommitted replace"
+        assert (backup / rel).read_text() == before, "the save did not capture the pre-edit state"
+        # Interrupt lands here. Recovery runs with the marker UNSET -> leave the live edit.
+        failed = snapshot_restore._restore_everything_from_rollback(backup, mc, [rel], installed)
+        assert failed == [], failed
+        assert (
+            store / "teams.json"
+        ).read_text() == concurrent, "rollback overwrote the concurrent edit"
+
     def test_a_hollow_memory_declaration_is_still_refused(self, tmp_path, monkeypatch, capsys):
         """The case the guard was written for, which the narrowing must not reach."""
         home = _home(tmp_path, monkeypatch)

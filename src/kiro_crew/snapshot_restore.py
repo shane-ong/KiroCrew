@@ -100,6 +100,7 @@ def _install_locked_document(
     *,
     only_if_absent: bool = False,
     save_existing: Callable[[Path], None] | None = None,
+    mark_committed: Callable[[], None] | None = None,
 ) -> bool:
     """Install (or, with *only_if_absent*, offer) a bundle's locked document into *mc*."""
     from kiro_crew import crew_teams  # a store module; imported on first use only
@@ -107,7 +108,11 @@ def _install_locked_document(
     rel = _LOCKED_DOCUMENT_TREES[tree]
     try:
         return crew_teams.install_document(
-            snap / rel, mc / tree, only_if_absent=only_if_absent, save_existing=save_existing
+            snap / rel,
+            mc / tree,
+            only_if_absent=only_if_absent,
+            save_existing=save_existing,
+            mark_committed=mark_committed,
         )
     except crew_teams.TeamsUnreadable as e:  # pragma: no cover - validated before mutation
         raise SourceComponentUnsound(
@@ -122,11 +127,17 @@ def _restore_locked_document(tree: str, saved: Path, mc: Path) -> None:
 
 
 def _remove_locked_document(
-    tree: str, mc: Path, *, save_existing: Callable[[Path], None] | None = None
+    tree: str,
+    mc: Path,
+    *,
+    save_existing: Callable[[Path], None] | None = None,
+    mark_committed: Callable[[], None] | None = None,
 ) -> None:
     from kiro_crew import crew_teams  # a store module; imported on first use only
 
-    crew_teams.remove_document(mc / tree, save_existing=save_existing)
+    crew_teams.remove_document(
+        mc / tree, save_existing=save_existing, mark_committed=mark_committed
+    )
 
 
 def _refuse_unless_valid_tree_document(src: Path, label: str, validator: str) -> None:
@@ -1241,15 +1252,25 @@ def _do_replace_mutations(
                 # directory is never swapped.
                 rel = _LOCKED_DOCUMENT_TREES[dirname]
                 save = _save_locked_document_to(backup, rel)
-                # The rollback copy is taken by the installer inside its lock hold, so
-                # `installed` is recorded only once the mutation has run: a failure
-                # before it leaves the live document exactly as it was, with nothing
-                # saved and nothing for recovery to undo.
+
+                # `installed` is this document's rollback MARKER, and it is set by
+                # `mark_committed` INSIDE the lock, immediately after the replace or
+                # removal commits -- never here, after the call returns. The save
+                # publishes the rollback copy BEFORE the commit, so a copy on disk is not
+                # proof the mutation ran: an interrupt between the save and the commit
+                # leaves a copy with the live document untouched, and recovery keyed on
+                # the copy's presence would overwrite a concurrent team edit with the
+                # stale saved document. Keyed on the marker, recovery restores the copy on
+                # exactly the interrupts that changed the live state and no others.
+                def _mark(rel: str = rel) -> None:
+                    installed.add(rel)
+
                 if (snap / rel).is_file():
-                    _install_locked_document(dirname, snap, mc, save_existing=save)
+                    _install_locked_document(
+                        dirname, snap, mc, save_existing=save, mark_committed=_mark
+                    )
                 else:
-                    _remove_locked_document(dirname, mc, save_existing=save)
-                installed.add(rel)
+                    _remove_locked_document(dirname, mc, save_existing=save, mark_committed=_mark)
                 continue
             if sd.is_dir():
                 installed.add(dirname)
@@ -1342,9 +1363,10 @@ def _restore_everything_from_rollback(
 ) -> list[str]:
     """Undo the mutation phase, target by target, using *targets* as the granularity.
 
-    The recovery half of replace-mode atomicity. Undoing the whole saved set returns the
-    data home to one coherent generation regardless of how far the pass got. Recovering
-    only the item that failed is what leaves memory half-old and half-new.
+    The recovery half of replace-mode atomicity. Undoing every target the mutation phase
+    reached returns the replaced state to one coherent generation regardless of how far
+    the pass got. Recovering only the item that failed is what leaves memory half-old and
+    half-new.
 
     **Granularity is the invariant, and it is exactly *targets*.** Every entry is a
     declared relative path, and recovery touches nothing else. Walking the rollback
@@ -1356,14 +1378,14 @@ def _restore_everything_from_rollback(
 
     Three cases per target, and the third is why *installed* exists:
 
-    * **Saved** — put it back, clearing only that path.
+    * **Saved, and this run reached it** — put it back, clearing only that path.
     * **Not saved, and this run installed it** — it did not exist before, so the copy the
       restore created is REMOVED. That is what "no pre-restore state" restores to.
-    * **Not saved, and this run never reached it** — LEFT ALONE. Absence of a saved copy
-      does not mean absence of prior state: a file is saved by MOVING it aside at the
-      moment of its own mutation, so a failure partway through the phase leaves every
-      later target untouched and unsaved. Removing those deletes the operator's own data
-      that this restore never so much as opened, which is the opposite of recovery.
+    * **This run never reached it** — LEFT ALONE, whether or not phase one saved a copy.
+      Whole-tree rollback copies are taken before any mutation, so a later target can have
+      a saved copy even though the restore never opened it. Putting that old copy back
+      would overwrite a dashboard write that landed after phase one. Core files are saved
+      by moving them aside at their own mutation point, but the same ledger rule applies.
 
     Best-effort per target, and it says so per target: a recovery that aborts on its
     first problem strands the rest, and by this point the operator's own data is what is
@@ -1380,6 +1402,23 @@ def _restore_everything_from_rollback(
     failed: list[str] = []
     locked_documents = {rel: tree for tree, rel in _LOCKED_DOCUMENT_TREES.items()}
     for rel in sorted(set(targets)):
+        # Phase one saves every whole tree before any mutation. A saved copy therefore
+        # proves only that the tree existed at the phase-one snapshot, not that this run
+        # later touched its live target. A dashboard write can land there while an earlier
+        # component is being replaced; if that earlier replacement fails, restoring this
+        # older saved copy would delete the concurrent write from a tree the restore never
+        # opened. The mutation ledger is the ownership proof for both saved and unsaved
+        # targets, so later targets are left exactly as they stand.
+        #
+        # A locked document is no exception: its marker is recorded INSIDE the lock
+        # after the mutation commits (see the mutation phase), so `rel in installed`
+        # means the live document really was replaced or removed. The rollback copy is
+        # published before that commit, so gating on the copy's presence instead would
+        # restore a stale document over a concurrent edit when an interrupt fell between
+        # the save and the commit -- the marker is what tells a committed mutation from a
+        # published-but-uncommitted one.
+        if rel not in installed:
+            continue
         saved = store_backup if rel == MEMORY_STORES_DIR_NAME and store_backup else backup / rel
         target = mc / rel
         try:

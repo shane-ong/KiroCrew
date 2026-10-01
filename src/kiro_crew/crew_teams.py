@@ -451,6 +451,7 @@ def install_document(
     *,
     only_if_absent: bool = False,
     save_existing: Callable[[Path], None] | None = None,
+    mark_committed: Callable[[], None] | None = None,
 ) -> bool:
     """Install the document *src* as the team list of the store at *directory*.
 
@@ -471,6 +472,14 @@ def install_document(
     is one, before it is replaced: a restore's rollback copy taken outside the
     lock could miss a write that commits between the copy and the install, and
     that write would then be lost from both the live store and the rollback.
+    *mark_committed* is called INSIDE the lock immediately AFTER the replace
+    commits -- and only then. It is the restore's rollback marker: a saved copy
+    is published before this commit, so its mere presence is not proof the
+    mutation ran, and rollback that trusted the copy alone would overwrite a
+    concurrent edit with the stale saved document when an interrupt fell between
+    the save and the commit. The marker is set only once the live document has
+    actually been replaced, so recovery restores the saved copy on exactly the
+    interrupts that changed the live state and no others.
     """
     dest = directory / TEAMS_FILE_NAME
     with document_lock(directory):
@@ -480,17 +489,25 @@ def install_document(
         if save_existing is not None and present:
             save_existing(dest)
         _write_document(dest, read_document(src))
+        if mark_committed is not None:
+            mark_committed()
     return True
 
 
 def remove_document(
-    directory: Path, *, save_existing: Callable[[Path], None] | None = None
+    directory: Path,
+    *,
+    save_existing: Callable[[Path], None] | None = None,
+    mark_committed: Callable[[], None] | None = None,
 ) -> bool:
     """Remove the store's document under its lock (a restore undoing an install).
 
     *save_existing* as in :func:`install_document`: the rollback copy is taken
-    inside the same lock hold that removes the document. Only a MISSING path
-    returns False; a directory or link at the name raises ``OSError`` so a
+    inside the same lock hold that removes the document. *mark_committed* as in
+    :func:`install_document`: called inside the lock immediately after the
+    removal commits, and only then, so recovery's rollback marker records the
+    removal exactly when it actually happened. Only a MISSING path returns
+    False; a directory or link at the name raises ``OSError`` so a
     document-less replace cannot succeed while leaving it there.
     """
     dest = directory / TEAMS_FILE_NAME
@@ -506,6 +523,8 @@ def remove_document(
         # sync the two sibling writers run (``_write_document``,
         # ``install_document``), inside the same lock hold.
         fsync_dir(directory, best_effort=True)
+        if mark_committed is not None:
+            mark_committed()
     return True
 
 
