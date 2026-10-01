@@ -1221,3 +1221,55 @@ async def test_reconcile_single_orphan_dm_is_not_wrapped_in_digest():
     msg = dm.await_args.args[0]
     assert "solo-1" in msg
     assert "restart digest" not in msg
+
+
+def _streams_then_fails(error: Exception, text: str = "the answer "):
+    def stream_factory(msg: str, *a, **kw):
+        async def _gen():
+            if text:
+                yield _text_event(text)
+            raise error
+
+        return _gen()
+
+    return stream_factory
+
+
+_GENERATE_FAILED = "The model failed to generate a response (transient error)."
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("keep", ["head", "tail"])
+async def test_generate_failed_after_output_keeps_the_output_with_a_warning(keep):
+    """Output already streamed survives a transient generate failure the retry cannot fix.
+
+    Longer than the keep cap, so a warning added before the cap would be cut off."""
+    error, text = _TransientError(_GENERATE_FAILED), "x" * 4000
+    mgr = _manager(_mock_sessions(_streams_then_fails(error, text)))
+    mgr.update_completion_keep(keep, 3000)
+    with patch("kiro_crew.subagent.transient_retry_delay", return_value=0.0):
+        info = await _spawn_and_wait(mgr)
+
+    assert info.outcome == "completed"
+    assert not info.error
+    assert info.partial is True
+    assert info.result.startswith("_Warning: the backend failed to generate")
+    assert "xxxx" in info.result
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("error", "text"),
+    [
+        (_TransientError("500 mid-stream"), "the answer "),  # transient, not generate-failed
+        (_FatalError(_GENERATE_FAILED), "the answer "),  # not transient
+        (_TransientError(_GENERATE_FAILED), " "),  # whitespace-only output
+    ],
+)
+async def test_other_failures_after_output_still_fail(error, text):
+    mgr = _manager(_mock_sessions(_streams_then_fails(error, text)))
+    with patch("kiro_crew.subagent.transient_retry_delay", return_value=0.0):
+        info = await _spawn_and_wait(mgr)
+
+    assert info.outcome == "failed"
+    assert info.error
