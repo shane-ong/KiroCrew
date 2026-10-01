@@ -1617,6 +1617,13 @@ def resource_status(name: str, args: dict[str, Any]) -> str:
             "\nGuidance: memory is tight — prefer the lighter path (targeted "
             "tests, fewer sub-agents, deferred builds) for heavy work."
         )
+    elif rstatus.memory_pressure_held:
+        # The posture is figure-based and can read AMPLE while the macOS kernel
+        # reports pressure; "heavy work is fine" would then contradict the gate.
+        out.append(
+            f"\nGuidance: macOS reports memory pressure — {host_status.PRESSURE_QUEUE_NOTE}; "
+            "prefer the lighter path for heavy work."
+        )
     elif rstatus.posture == "ample":
         out.append("\nGuidance: ample headroom — heavy work is fine.")
     else:

@@ -16,10 +16,12 @@ if TYPE_CHECKING:
         QUEUED_REASON_ADAPTIVE_CAP_ZERO,
         QUEUED_REASON_CONCURRENCY_LIMIT,
         QUEUED_REASON_LOW_MEMORY,
+        QUEUED_REASON_MEMORY_PRESSURE,
         QUEUED_REASON_POSTURE_CRITICAL,
         KiroCrewConfig,
         ParentSpawnPolicy,
         SubagentInfo,
+        _owns_dedicated_runtime,
         _startup_memory_reserve_gb,
         _validate_agent,
         _validate_app_agent_ownership,
@@ -841,6 +843,82 @@ class _GateMixin(ManagerComponent):
                 },
             )
 
+        # One cached off-thread verdict serves both the pressure hold and the
+        # posture gate below.
+        admission = cached_admission_check()
+
+        # --- macOS kernel memory-pressure hold: part of the memory floor above,
+        # not a second rule. The reclaimable figure cleared the floor, but the
+        # kernel says WARN or worse, so a new dedicated runtime would land in
+        # compression and swap. Read from the same cached probe as the posture
+        # gate below (no sysctl on the loop). Off with the floor (0), and only
+        # while a dedicated runtime of ours is running or warming: otherwise the
+        # pressure is not ours to relieve and the start would wait on nothing.
+        # Every start counts as dedicated here, because whether one will share
+        # its parent's runtime is decided only at launch. A nested child is never
+        # held: its parent is a live dedicated runtime of ours that is waiting on
+        # it, so holding the child would wait on an episode only it can end. ---
+        _is_child = bool(self._manager._admission.taskq_parent_id_for(parent_session_key))
+        pressure_level = admission.memory_pressure_level
+        if not admission.memory_pressure_held:
+            # The episode is over: the next hold is a new one and warns again.
+            self._manager._pressure_hold_level = None
+        elif (
+            min_mem > 0
+            and not _dispatch_now
+            and not _is_child
+            and _owns_dedicated_runtime(agents_snapshot, running_count=self._manager._running_count)
+        ):
+            # WARNING once per pressure level; the re-check of every queued row
+            # each admit wait would otherwise log one line per row per pass.
+            log = logger.debug
+            if self._manager._pressure_hold_level != pressure_level:
+                self._manager._pressure_hold_level = pressure_level
+                log = logger.warning
+            log(
+                "Subagent spawn %s: macOS reports memory pressure (%s) while a "
+                "dedicated subagent is running (%.2f GB reclaimable).",
+                "deferred" if _durable else "refused",
+                platform_compat.memory_pressure_name(pressure_level),
+                avail_gb,
+            )
+            sel().log_tool_invocation(
+                session_key=parent_session_key or "",
+                source="subagent",
+                tool_name="spawn_run",
+                outcome="deferred_memory_pressure" if _durable else "refused_memory_pressure",
+                metadata={
+                    "memory_pressure_level": pressure_level,
+                    "available_gb": avail_gb,
+                    **_task_audit,
+                },
+            )
+            info = SubagentInfo(
+                id=agent_id,
+                task=_redacted_task,
+                memory_mode=_memory_mode,
+                agent=agent,
+                parent_session_key=parent_session_key,
+                done=True,
+                error="spawn refused: macOS reports memory pressure; retry later",
+                batch_id=batch_id,
+                batch_total=max(0, int(batch_total)),
+            )
+            # No GB figures, in the text or the wait: the figure cleared the
+            # floor, so any "N GB free, needs M GB" pair would contradict this.
+            deferred = (
+                _deferred(
+                    "macOS reports memory pressure; waiting until it eases or a running subagent finishes",
+                    info,
+                    wait={"reason": QUEUED_REASON_MEMORY_PRESSURE},
+                )
+                if _durable
+                else None
+            )
+            if deferred is not None:
+                return deferred
+            return self._manager._announce_rejection(info)
+
         # --- Admission gate: DEFER new spawns while host memory posture is
         # critical (refuse only when no durable store backs the deferral).
         # Complements the absolute spawn_min_memory_gb floor above with the
@@ -851,7 +929,6 @@ class _GateMixin(ManagerComponent):
         # staleness is acceptable for pressure-shedding. In-flight subagents
         # are untouched; direct user chat turns are not gated; fails open on
         # an unknown posture. ---
-        admission = cached_admission_check()
         if not admission.admitted and not _dispatch_now:
             logger.warning(
                 "Subagent spawn %s: %s", "deferred" if _durable else "refused", admission.reason
@@ -902,7 +979,6 @@ class _GateMixin(ManagerComponent):
         # reserved slot(s) while nested work is pending or a parent waits on
         # its children; only children and resuming parents may. The gate
         # above answered for the whole cap, so narrow it here for roots.
-        _is_child = bool(self._manager._admission.taskq_parent_id_for(parent_session_key))
         if (
             not should_queue
             and not _dispatch_now

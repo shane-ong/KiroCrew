@@ -717,7 +717,7 @@
       "sensitive": false,
       "tags": [],
       "label": "Spawn Min Memory GB",
-      "help": "Minimum available memory (GB) required to spawn a subagent. 0 disables the check.",
+      "help": "Minimum available memory (GB) required to spawn a subagent. On macOS a start also waits while the kernel reports memory pressure and one of this gateway's dedicated subagents is running. 0 disables the check, that wait included.",
       "hasChildren": false,
       "enumValues": null,
       "defaultValue": 4.0

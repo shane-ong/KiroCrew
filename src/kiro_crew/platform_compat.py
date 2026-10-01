@@ -1975,7 +1975,9 @@ def _darwin_sysctl_handle() -> Any:
 
     Cached for the same reason as the libproc handle: the argv probe runs per
     descendant on the liveness oracle's cadence, and a fresh ``CDLL`` per call
-    would dlopen every time.
+    would dlopen every time. ``sysctlbyname`` is declared on the same handle for
+    :func:`memory_pressure_level`, in its own guard, so a libc without it still
+    serves ``sysctl``.
     """
     global _darwin_libc_sysctl, _darwin_libc_sysctl_loaded
     if _darwin_libc_sysctl_loaded:
@@ -1998,6 +2000,18 @@ def _darwin_sysctl_handle() -> Any:
         _darwin_libc_sysctl = libc
     except Exception:
         _darwin_libc_sysctl = None
+        return None
+    try:
+        libc.sysctlbyname.argtypes = [
+            ctypes.c_char_p,
+            ctypes.c_void_p,
+            ctypes.POINTER(ctypes.c_size_t),
+            ctypes.c_void_p,
+            ctypes.c_size_t,
+        ]
+        libc.sysctlbyname.restype = ctypes.c_int
+    except AttributeError:
+        pass  # memory_pressure_level reads the absent symbol as "unknown"
     return _darwin_libc_sysctl
 
 
@@ -9985,6 +9999,70 @@ def host_available_mib() -> int:
         mem = system_memory()  # GlobalMemoryStatusEx: (total, available)
         return (mem[1] // _MIB_BYTES) if mem else 0
     return 0
+
+
+#: The values ``kern.memorystatus_vm_pressure_level`` answers in. XNU's handler
+#: (``bsd/kern/kern_memorystatus_notify.c``) converts its internal level through
+#: ``convert_internal_pressure_level_to_dispatch_level`` before answering, so
+#: the reading is ``NOTE_MEMORYSTATUS_PRESSURE_*`` from ``sys/event_private.h``.
+#: Those are the same numbers as libdispatch's public
+#: ``DISPATCH_MEMORYPRESSURE_NORMAL`` / ``_WARN`` / ``_CRITICAL``. The internal
+#: "urgent" level reports as WARN.
+MEMORY_PRESSURE_NORMAL = 1
+MEMORY_PRESSURE_WARN = 2
+MEMORY_PRESSURE_CRITICAL = 4
+_MEMORY_PRESSURE_NAMES = {
+    MEMORY_PRESSURE_NORMAL: "NORMAL",
+    MEMORY_PRESSURE_WARN: "WARN",
+    MEMORY_PRESSURE_CRITICAL: "CRITICAL",
+}
+_MEMORY_PRESSURE_SYSCTL = b"kern.memorystatus_vm_pressure_level"
+
+
+def memory_pressure_level() -> int | None:
+    """The macOS kernel's memory-pressure level, or ``None`` when unknown.
+
+    Answers one of :data:`MEMORY_PRESSURE_NORMAL`, :data:`MEMORY_PRESSURE_WARN`
+    or :data:`MEMORY_PRESSURE_CRITICAL`, the level Activity Monitor's
+    memory-pressure graph shows. It is the kernel's own verdict, and it LAGS: a
+    16 GB Mac has read NORMAL with 4.9 GB in the compressor and 4.8 of 6.0 GB of
+    swap in use. So it is no measure of available memory and cannot replace a
+    figure such as :func:`host_available_mib`. A caller uses it as a backstop
+    beside such a figure: when the kernel does say WARN, the host is short
+    whatever the page counters add up to.
+
+    ``None`` everywhere other than macOS, and on any failure: no ``libc``, no
+    ``sysctlbyname``, a failed call, a wrong-size answer, or a value that is not
+    one of the three levels. A caller treats ``None`` as "no reading" and fails
+    open, the same contract as ``host_available_mib``'s 0.
+
+    Reads in-process through the cached :func:`_darwin_sysctl_handle`, with no
+    ``sysctl`` subprocess, for the reason given in :func:`macos_vm_statistics`.
+    On macOS the sysctl needs no privilege; XNU checks one only on other Apple
+    platforms.
+    """
+    if not IS_MACOS:
+        return None
+    sysctlbyname = getattr(_darwin_sysctl_handle(), "sysctlbyname", None)
+    if sysctlbyname is None:
+        return None
+    level = ctypes.c_uint32(0)
+    size = ctypes.c_size_t(ctypes.sizeof(level))
+    try:
+        result = sysctlbyname(
+            _MEMORY_PRESSURE_SYSCTL, ctypes.byref(level), ctypes.byref(size), None, 0
+        )
+    except (OSError, ValueError, ctypes.ArgumentError):
+        return None
+    if result != 0 or size.value != ctypes.sizeof(level):
+        return None
+    value = int(level.value)
+    return value if value in _MEMORY_PRESSURE_NAMES else None
+
+
+def memory_pressure_name(level: int | None) -> str:
+    """``"NORMAL"`` / ``"WARN"`` / ``"CRITICAL"`` for *level*, ``""`` when unknown."""
+    return _MEMORY_PRESSURE_NAMES.get(level, "") if level is not None else ""
 
 
 # ---------------------------------------------------------------------------

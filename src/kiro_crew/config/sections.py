@@ -1180,7 +1180,10 @@ class AgentConfig:
         default=4.0,
         metadata=_meta(
             "Spawn Min Memory GB",
-            "Minimum available memory (GB) required to spawn a subagent. 0 disables the check.",
+            "Minimum available memory (GB) required to spawn a subagent. On macOS a "
+            "start also waits while the kernel reports memory pressure and one of "
+            "this gateway's dedicated subagents is running. 0 disables the check, "
+            "that wait included.",
         ),
     )
     resource_pressure_gb: float = field(

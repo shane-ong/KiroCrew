@@ -176,6 +176,74 @@ Windows. A known cgroup bound still applies when the Linux host reading fails.
 Auto-sizing and the runtime gate are independent guards; readings fail open
 only when neither host memory nor a finite cgroup limit is available.
 
+**macOS: the kernel memory-pressure hold.** The macOS reading of the floor has
+a second input: `platform_compat.memory_pressure_level()`, the kernel's
+`kern.memorystatus_vm_pressure_level`. `resource_status.probe()` reads it once
+per probe into `ResourceStatus.memory_pressure_level`, and the cached
+`AdmissionDecision` carries it to the gate. The gate holds a start when five
+things are true together:
+
+- the floor is on (`spawn_min_memory_gb > 0`);
+- the reclaimable figure cleared it;
+- the level is WARN or CRITICAL;
+- a dedicated subagent runtime of this gateway is running or warming
+  (`_owns_dedicated_runtime`: the population `_startup_memory_reserve_gb`
+  prices, less a row parked at the pre-execution spawn approval, which has no
+  process yet);
+- the start is not a nested child (`taskq_parent_id_for`). A child's parent is
+  a live runtime of ours that is waiting on it, so holding the child would hold
+  the parent too, on an episode only the child can end.
+
+The level is the kernel's own verdict, and it lags. A 16 GB Mac has read NORMAL
+with 4.9 GB in the compressor and 4.8 of 6.0 GB of swap in use, so the level is
+no measure of free memory and does not replace the figure. It is a backstop
+beside the floor: when the kernel does say WARN, the host is short whatever the
+page counters add up to, and a new dedicated runtime would land in compression
+and swap.
+
+The hold applies to dedicated starts. The gate cannot yet tell that a start
+will share its parent's runtime, because that is decided at launch
+(`_should_use_session_sharing_impl`, after model and effort resolution). So
+every start is treated as dedicated here, the same assumption the warming
+reserve makes.
+
+With no dedicated runtime of ours running, the pressure is not ours to
+relieve, and the start is admitted on the figure alone, so a start never waits
+on an episode it cannot end. Otherwise the hold lasts as long as the pressure
+does. No maximum wait bounds it yet; a queued spawn's maximum wait, once one
+exists, applies to this hold too.
+
+What a held start looks like:
+
+- A persistent row waits as `QUEUED_REASON_MEMORY_PRESSURE`, with the
+  figure-free detail "macOS reports memory pressure; waiting until it eases or
+  a running subagent finishes" and SEL outcome `deferred_memory_pressure`. Both
+  end the hold: the level dropping below WARN, or the last dedicated runtime of
+  ours finishing.
+- A restricted spawn (incognito, temporary, no task store) has no durable row
+  to defer, so it is refused, exactly as below the floor: "spawn refused: macOS
+  reports memory pressure; retry later", SEL outcome
+  `refused_memory_pressure`.
+- Neither carries GB figures, because the figure cleared the floor and any
+  "N GB free, needs M GB" pair would contradict the verdict.
+- The hold logs WARNING once per level (`_pressure_hold_level`) and DEBUG on
+  every later re-check, so a long episode does not log one line per queued row
+  per admit wait.
+
+The level never rewrites the figure, and never moves the posture, which stays
+figure-based. It is reported beside them: `summary_lines` (the
+`resource_status` tool, whose guidance then says new dedicated subagents may
+queue instead of "heavy work is fine"), the `[RESOURCES]` context line, and the
+diagnostics bundle. `prewarm_allowance` holds no speculative session at WARN or
+worse. The cron, runner and adaptive-controller gates do not read the level.
+
+**What the memory guard promises.** With a readable reading, admission starts a
+subagent only when free memory covers the floor plus `subagent_cost_gb` per
+warming start. A start that settles heavier than that price, or a host that
+cannot be measured, can still go below the floor. Admission does not shed
+running work either: a settled child that runs builds or tests can push the
+host below the floor afterwards.
+
 When enabled, the per-spawn guard adds `_startup_memory_reserve_gb` to that
 floor. Every warming start -- the next one, a claim awaiting registration, a
 dedicated worker fewer than `_RSS_SAMPLES_TO_SETTLE` (2) sweeps have measured --
@@ -424,7 +492,8 @@ Admission order (`subagent_manager/admission/gate.py::spawn_impl`):
 2. For persistent work, **persist** the row in the task store (write-before-ack; see § Durable task
    queue). A store write failure is a refusal with
    `error_code="task_store_unavailable"`; the id is never handed out as accepted.
-3. Memory floor (`spawn_min_memory_gb`) and posture gate (`admission_gate`,
+3. Memory floor (`spawn_min_memory_gb`, with its macOS kernel memory-pressure
+   hold; see § Concurrency Auto-Sizing) and posture gate (`admission_gate`,
    `cached_admission_check`): with a persistent row, **defer** (row stays `queued`,
    `next_run_at = now + admit_wait_secs`, pump wake-up armed, caller gets a
    `queued` id); without one, refuse as before.
@@ -442,7 +511,8 @@ Admission order (`subagent_manager/admission/gate.py::spawn_impl`):
 `SubagentInfo.queued_reason` on the `queued` record they return — one of the
 kinds defined in the leaf module `kiro_crew.subagent_wait_reasons` (re-exported by
 `kiro_crew.subagent`; the channel command layer reads them from the leaf so it never
-imports `kiro_crew.subagent` at runtime): `QUEUED_REASON_LOW_MEMORY` / `QUEUED_REASON_POSTURE_CRITICAL` (step 3, with
+imports `kiro_crew.subagent` at runtime): `QUEUED_REASON_LOW_MEMORY` /
+`QUEUED_REASON_MEMORY_PRESSURE` / `QUEUED_REASON_POSTURE_CRITICAL` (step 3, with
 `queued_reason_detail` = the gate's own sentence, the same text the task store's
 `deferred` event records), `QUEUED_REASON_ADAPTIVE_CAP_ZERO` (step 4 when the
 effective cap is 0) or `QUEUED_REASON_CONCURRENCY_LIMIT` (step 4 otherwise: a
@@ -450,8 +520,8 @@ taken slot or the stagger tick). The label is a report of a decision already
 made; no gate reads it back. Two consumers:
 
 - The advisory `subagent_queued` lifecycle event (`_emit_queue_depth`) carries
-  `reason` and, for the memory kinds, `available_gb` / `required_gb` beside
-  `queued`. The label is remembered per parent (`_queue_wait`) so the drain's,
+  `reason` and, for the low-memory and posture kinds, `available_gb` /
+  `required_gb` beside `queued`. The memory-pressure kind carries no figures. The label is remembered per parent (`_queue_wait`) so the drain's,
   the claim path's (once a claimed row registers, so a started row leaves the
   count) and the cancel path's re-emits — which carry no verdict of their own —
   keep it, and
@@ -467,7 +537,7 @@ made; no gate reads it back. Two consumers:
   does exist for that parent.
   An event without `reason` (nothing labelled, or an older gateway) leaves the
   dashboard on its default "queued behind the concurrency limit" text; the
-  memory and adaptive kinds render their own sentence
+  memory, memory-pressure and adaptive kinds render their own sentence
   (`website/src/pages/chat/subagentQueuedReason.ts`), visibly on the run card
   and the composer chip as well as in their tooltips, and with a figure-less
   sentence when the event names the kind but not the numbers. The dashboard
@@ -476,7 +546,7 @@ made; no gate reads it back. Two consumers:
   `sseSubagentQueued` reducer (`website/src/store/chat/subagents.ts`), which
   rewrites or clears both on every frame, so a count never sits under a stale
   reason.
-- `POST /api/spawn` answers the three DEFERRED kinds (`DEFERRED_QUEUED_REASONS`)
+- `POST /api/spawn` answers the four DEFERRED kinds (`DEFERRED_QUEUED_REASONS`)
   with `status: "queued"`, `reason` and `reason_detail` under the same `id`;
   every reader of that answer relays it: `spawn_run` prints a
   `Queued N subagent(s). Not started yet: <detail> …` group apart from the
@@ -1708,8 +1778,9 @@ Specified in [taskq.md](taskq.md); this section is the manager's side of it.
   line naming the queue depth and store state, so a hold that is never released
   is visible instead of presenting as rows accepted but never claimed.
 - **Memory pressure defers.** See admission order step 3. SEL outcomes:
-  `deferred_low_memory` / `deferred_memory_critical` (store) vs the legacy
-  `refused_low_memory` / `refused_memory_critical`.
+  `deferred_low_memory` / `deferred_memory_pressure` / `deferred_memory_critical`
+  (store) vs the legacy `refused_low_memory` / `refused_memory_pressure` /
+  `refused_memory_critical`.
 - **Nested tree.** `taskq_accept` sets `parent_id` (and inherits `root_id`)
   when the spawning session is `subagent:<id>` and that id has a row, so the
   store holds the S → A → B links a restart rebuilds from.

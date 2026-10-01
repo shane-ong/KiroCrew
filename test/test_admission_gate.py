@@ -39,7 +39,7 @@ def _cfg(pressure: float = 4.0, critical: float = 2.0, gate: bool = True) -> Sim
     )
 
 
-def _refused() -> rs.AdmissionDecision:
+def _refused(memory_pressure_level: int | None = None) -> rs.AdmissionDecision:
     return rs.AdmissionDecision(
         admitted=False,
         posture=rs.POSTURE_CRITICAL,
@@ -48,13 +48,40 @@ def _refused() -> rs.AdmissionDecision:
             "host memory is critical (~1.2 GB free, critical \u2264 2 GB) — "
             "retry when memory frees"
         ),
+        memory_pressure_level=memory_pressure_level,
     )
 
 
-def _admitted() -> rs.AdmissionDecision:
+def _admitted(memory_pressure_level: int | None = None) -> rs.AdmissionDecision:
     return rs.AdmissionDecision(
-        admitted=True, posture=rs.POSTURE_AMPLE, available_gb=16.0
+        admitted=True,
+        posture=rs.POSTURE_AMPLE,
+        available_gb=16.0,
+        memory_pressure_level=memory_pressure_level,
     )
+
+
+@pytest.fixture(autouse=True)
+def _close_managers(close_subagent_managers) -> None:
+    """Every manager built here opens tasks.db; close it at teardown, not at GC."""
+
+
+#: Ceiling on waiting for a ``subagent_queued`` emit. The emit follows one
+#: writer-thread round trip, measured in milliseconds; this bounds a lost run on
+#: a loaded shard and is never a pass condition.
+_QUEUED_EMIT_CEILING_SECS = 5.0
+
+
+async def _await_queued_event(events: list[dict[str, Any]], reason: str | None = None) -> None:
+    """Wait for a ``subagent_queued`` extra (one carrying *reason*, when given);
+    RAISE, naming what was read, at the ceiling."""
+    deadline = time.monotonic() + _QUEUED_EMIT_CEILING_SECS
+    while not any(reason is None or e.get("reason") == reason for e in events):
+        assert time.monotonic() < deadline, (
+            f"no subagent_queued{f' with reason {reason!r}' if reason else ''} within "
+            f"{_QUEUED_EMIT_CEILING_SECS}s; events={events!r}"
+        )
+        await asyncio.sleep(0.01)
 
 
 async def _wait_for(predicate, timeout=5.0, interval=0.05):
@@ -458,16 +485,24 @@ class TestSpawnAdmissionGate:
     # unchanged here; only what it tells the caller is.
 
     def _spawn_capturing_queued(
-        self, mgr, *, memory: tuple[bool, float], admission: rs.AdmissionDecision
-    ) -> tuple[Any, list[dict[str, Any]]]:
-        """Run ``spawn`` on a live loop and collect every ``subagent_queued`` extra."""
+        self,
+        mgr,
+        *,
+        memory: tuple[bool, float],
+        admission: rs.AdmissionDecision,
+        memory_mode: str | None = None,
+        floor_gb: float = 4.0,
+        parent_session_key: str = "sess-1",
+    ) -> tuple[Any, list[dict[str, Any]], MagicMock]:
+        """Run ``spawn`` on a live loop; return the info, every ``subagent_queued``
+        extra, and the SEL mock. A refused spawn emits nothing and is not waited on."""
         events: list[dict[str, Any]] = []
 
         async def on_event(etype: str, info: Any, extra: dict[str, Any]) -> None:
             if etype == "subagent_queued":
                 events.append(dict(extra))
 
-        async def run() -> Any:
+        async def run() -> tuple[Any, MagicMock]:
             mgr._on_event = on_event
             with (
                 patch("kiro_crew.subagent.check_memory_available", return_value=memory),
@@ -475,22 +510,25 @@ class TestSpawnAdmissionGate:
                 patch("kiro_crew.subagent.cached_admission_check", return_value=admission),
                 patch("kiro_crew.subagent.sel") as mock_sel,
             ):
-                mock_cfg.load.return_value.agent.spawn_min_memory_gb = 4.0
+                mock_cfg.load.return_value.agent.spawn_min_memory_gb = floor_gb
                 mock_cfg.load.return_value.agent.subagent_cost_gb = 0.5
                 mock_sel.return_value.log_tool_invocation = MagicMock()
-                info = mgr.spawn(task="test task", parent_session_key="sess-1")
-            deadline = time.monotonic() + 2.0
-            while not events and time.monotonic() < deadline:
-                await asyncio.sleep(0.01)
-            return info
+                info = mgr.spawn(
+                    task="test task",
+                    parent_session_key=parent_session_key,
+                    _memory_mode=memory_mode,
+                )
+            if info is not None and info.queued and not info.done:
+                await _await_queued_event(events)
+            return info, mock_sel
 
-        info = asyncio.run(run())
-        return info, events
+        info, mock_sel = asyncio.run(run())
+        return info, events, mock_sel
 
     def test_low_memory_deferral_names_its_reason_on_the_queued_event(self) -> None:
         mgr = self._mgr()
         assert mgr._taskq is not None
-        info, events = self._spawn_capturing_queued(
+        info, events, _sel = self._spawn_capturing_queued(
             mgr, memory=(False, 3.2), admission=_admitted()
         )
         assert info is not None and info.queued is True and info.done is False
@@ -507,7 +545,7 @@ class TestSpawnAdmissionGate:
     def test_posture_critical_deferral_names_its_reason_on_the_queued_event(self) -> None:
         mgr = self._mgr()
         assert mgr._taskq is not None
-        info, events = self._spawn_capturing_queued(
+        info, events, _sel = self._spawn_capturing_queued(
             mgr, memory=(True, 8.0), admission=_refused()
         )
         assert info is not None and info.queued is True
@@ -516,6 +554,240 @@ class TestSpawnAdmissionGate:
         assert events and events[-1]["reason"] == "posture_critical"
         assert events[-1]["available_gb"] == pytest.approx(_refused().available_gb)
         assert "required_gb" not in events[-1]
+
+    # ── macOS kernel memory pressure: a hold inside the memory floor ─────────
+    #
+    # The reclaimable figure cleared the floor; the kernel says WARN or worse.
+    # A dedicated start is held while one of ours is running, with a reason that
+    # names no GB figures, because any pair would contradict the verdict.
+
+    _PRESSURE_DETAIL = "macOS reports memory pressure; waiting until it eases or a running subagent finishes"
+    _PRESSURE_REFUSAL = "spawn refused: macOS reports memory pressure; retry later"
+
+    @staticmethod
+    def _busy(mgr) -> None:
+        """Give *mgr* one live dedicated child: a runtime of ours the hold can wait on."""
+        from kiro_crew.subagent import SubagentInfo
+
+        mgr._agents["busy"] = SubagentInfo(
+            id="busy", task="w", parent_session_key="sess-0", _pid=4242
+        )
+
+    @staticmethod
+    def _outcomes(mock_sel: MagicMock) -> list[str]:
+        return [c[1]["outcome"] for c in mock_sel.return_value.log_tool_invocation.call_args_list]
+
+    @pytest.mark.parametrize("level", [2, 4])
+    def test_pressure_holds_a_start_the_figure_admits(self, level: int) -> None:
+        mgr = self._mgr()
+        self._busy(mgr)
+        info, events, mock_sel = self._spawn_capturing_queued(
+            mgr, memory=(True, 8.0), admission=_admitted(memory_pressure_level=level)
+        )
+        assert info is not None and info.queued is True and info.done is False
+        assert info.queued_reason == "memory_pressure"
+        assert info.queued_reason_detail == self._PRESSURE_DETAIL
+        assert events[-1]["reason"] == "memory_pressure"
+        assert "available_gb" not in events[-1] and "required_gb" not in events[-1]
+        call = mock_sel.return_value.log_tool_invocation.call_args[1]
+        assert call["outcome"] == "deferred_memory_pressure"
+        assert call["metadata"]["memory_pressure_level"] == level
+
+    @pytest.mark.parametrize(
+        ("busy", "level", "floor_gb", "parent"),
+        [
+            # Never stuck: nothing of ours to finish, so the start would wait on
+            # an episode it cannot end.
+            pytest.param(False, 2, 4.0, "sess-1", id="no-runtime-of-ours"),
+            pytest.param(True, None, 4.0, "sess-1", id="level-unreadable"),
+            pytest.param(True, 1, 4.0, "sess-1", id="level-normal"),
+            pytest.param(True, 4, 0.0, "sess-1", id="floor-off"),
+            # The busy runtime IS this child's parent, waiting on it: holding the
+            # child would hold the parent on an episode only the child can end.
+            pytest.param(True, 2, 4.0, "subagent:busy", id="nested-child"),
+        ],
+    )
+    def test_the_hold_lets_a_start_through(
+        self, busy: bool, level: int | None, floor_gb: float, parent: str
+    ) -> None:
+        """The posture gate is set to refuse, so the start is parked one gate
+        LATER, which proves it passed the pressure hold."""
+        mgr = self._mgr()
+        if busy:
+            self._busy(mgr)
+        info, _events, mock_sel = self._spawn_capturing_queued(
+            mgr,
+            memory=(True, 8.0),
+            admission=_refused(memory_pressure_level=level),
+            floor_gb=floor_gb,
+            parent_session_key=parent,
+        )
+        assert info is not None and info.queued_reason == "posture_critical"
+        assert "deferred_memory_pressure" not in self._outcomes(mock_sel)
+
+    @pytest.mark.parametrize(
+        ("exec_started", "held"),
+        [
+            # Parked at the pre-execution spawn approval: no process yet.
+            pytest.param(None, False, id="parked-at-spawn-approval"),
+            # Waiting on a mid-run tool prompt: its runtime is live.
+            pytest.param(1.0, True, id="waiting-on-a-tool-prompt"),
+        ],
+    )
+    def test_an_approval_wait_counts_only_with_a_runtime(
+        self, exec_started: float | None, held: bool
+    ) -> None:
+        from kiro_crew.subagent import SubagentInfo
+
+        mgr = self._mgr()
+        mgr._agents["parked"] = SubagentInfo(
+            id="parked",
+            task="w",
+            parent_session_key="sess-0",
+            _awaiting_approval=True,
+            _exec_started=exec_started,
+        )
+        info, _events, _sel = self._spawn_capturing_queued(
+            mgr, memory=(True, 8.0), admission=_refused(memory_pressure_level=2)
+        )
+        assert info is not None
+        assert info.queued_reason == ("memory_pressure" if held else "posture_critical")
+
+    def test_a_restricted_spawn_under_pressure_is_refused_without_figures(self) -> None:
+        """A temporary spawn has no durable row to defer, so like a spawn below the
+        floor it is refused, with the same figure-free pressure wording."""
+        mgr = self._mgr()
+        self._busy(mgr)
+        info, events, mock_sel = self._spawn_capturing_queued(
+            mgr,
+            memory=(True, 8.0),
+            admission=_admitted(memory_pressure_level=2),
+            memory_mode="temporary",
+        )
+        assert info is not None and info.done is True and info.queued is False
+        assert info.error == self._PRESSURE_REFUSAL
+        assert events == []
+        call = mock_sel.return_value.log_tool_invocation.call_args[1]
+        assert call["outcome"] == "refused_memory_pressure"
+        assert call["metadata"]["memory_pressure_level"] == 2
+
+    def test_a_hold_warns_once_per_level(self, caplog: pytest.LogCaptureFixture) -> None:
+        """Every queued row is re-checked each admit wait; a long episode must
+        not log a WARNING per row per pass."""
+        mgr = self._mgr()
+        self._busy(mgr)
+
+        def warnings() -> int:
+            return sum(
+                r.levelno == logging.WARNING and "macOS reports memory pressure" in r.getMessage()
+                for r in caplog.records
+            )
+
+        with caplog.at_level(logging.DEBUG, logger="kiro_crew.subagent"):
+            for _ in range(3):
+                self._spawn_capturing_queued(
+                    mgr, memory=(True, 8.0), admission=_admitted(memory_pressure_level=2)
+                )
+            assert warnings() == 1
+            self._spawn_capturing_queued(
+                mgr, memory=(True, 8.0), admission=_admitted(memory_pressure_level=4)
+            )
+            assert warnings() == 2
+
+    def test_the_real_reader_holds_a_start_through_the_gate(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """End to end on the readers: only the platform flags, the Mach figure and
+        the kernel level are faked. The floor check runs the real
+        ``check_memory_available``; the pressure level comes from the real probe
+        (``admission_check``, called synchronously in place of its cached form,
+        whose refresh runs on a background thread)."""
+        import kiro_crew.subagent as subagent_mod
+        from kiro_crew import platform_compat
+
+        for name in ("LINUX", "WINDOWS", "MACOS"):
+            monkeypatch.setattr(platform_compat, "IS_" + name, name == "MACOS")
+        # 8 GB reclaimable clears the 4.0 GB floor plus warming-start reserves.
+        monkeypatch.setattr(subagent_mod, "_macos_available_memory_gb", lambda: 8.0)
+        monkeypatch.setattr(
+            platform_compat, "memory_pressure_level", lambda: platform_compat.MEMORY_PRESSURE_WARN
+        )
+        monkeypatch.setattr(subagent_mod, "cached_admission_check", rs.admission_check)
+        mgr = self._mgr()
+        self._busy(mgr)
+        events: list[dict[str, Any]] = []
+
+        async def on_event(etype: str, info: Any, extra: dict[str, Any]) -> None:
+            if etype == "subagent_queued":
+                events.append(dict(extra))
+
+        async def run() -> Any:
+            mgr._on_event = on_event
+            with (
+                patch("kiro_crew.subagent.KiroCrewConfig") as mock_cfg,
+                patch("kiro_crew.subagent.sel"),
+            ):
+                mock_cfg.load.return_value.agent.spawn_min_memory_gb = 4.0
+                mock_cfg.load.return_value.agent.subagent_cost_gb = 0.5
+                info = mgr.spawn(task="test task", parent_session_key="sess-1")
+            await _await_queued_event(events)
+            return info
+
+        info = asyncio.run(run())
+        assert info is not None and info.queued is True
+        assert info.queued_reason == "memory_pressure"
+        assert events[-1]["reason"] == "memory_pressure"
+
+    def test_the_drain_re_check_parks_the_pressure_label(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The pump's re-check of a held row goes through ``park_defer``; the label
+        it parks is what the post-write emit publishes, so it must be the pressure
+        reason and not None (which would fall back to a stale or default text)."""
+        from kiro_crew.subagent_manager.admission import SpawnAdmissionCoordinator
+
+        monkeypatch.setattr(SpawnAdmissionCoordinator, "open_store_off_loop", True)
+        monkeypatch.setattr(SpawnAdmissionCoordinator, "pump_off_loop", True)
+        events: list[dict[str, Any]] = []
+
+        async def on_event(etype: str, info: Any, extra: dict[str, Any]) -> None:
+            if etype == "subagent_queued":
+                events.append(dict(extra))
+
+        async def run() -> tuple[Any, MagicMock]:
+            mgr = self._mgr()
+            await asyncio.wait_for(mgr.wait_taskq_ready(), _QUEUED_EMIT_CEILING_SECS)
+            self._busy(mgr)
+            mgr._spawn_stagger_secs = 0.0
+            mgr._taskq_admit_wait_secs = 0.05  # the held row is due again at once
+            mgr._on_event = on_event
+            park = MagicMock(wraps=mgr._admission.park_defer)
+            with (
+                patch("kiro_crew.subagent.check_memory_available", return_value=(True, 8.0)),
+                patch("kiro_crew.subagent.KiroCrewConfig") as mock_cfg,
+                patch(
+                    "kiro_crew.subagent.cached_admission_check",
+                    return_value=_admitted(memory_pressure_level=2),
+                ),
+                patch("kiro_crew.subagent.sel"),
+                patch.object(type(mgr._admission), "park_defer", park),
+            ):
+                mock_cfg.load.return_value.agent.spawn_min_memory_gb = 4.0
+                mock_cfg.load.return_value.agent.subagent_cost_gb = 0.5
+                info = await mgr.spawn_async("test task", parent_session_key="sess-1")
+                # The direct path: the spawn's own deferral emits the label.
+                await _await_queued_event(events, reason="memory_pressure")
+                deadline = time.monotonic() + _QUEUED_EMIT_CEILING_SECS
+                while not park.call_count:
+                    assert time.monotonic() < deadline, "the pump never re-checked the row"
+                    mgr._drain_queue()
+                    await asyncio.sleep(0.02)
+            return info, park
+
+        info, park = asyncio.run(run())
+        assert info is not None and info.queued_reason == "memory_pressure"
+        assert park.call_args.kwargs["wait"] == {"reason": "memory_pressure"}
+        assert park.call_args.kwargs["reason"] == self._PRESSURE_DETAIL
 
     def test_parked_defer_publishes_the_label_only_after_the_write_succeeds(self) -> None:
         """The coroutine dispatcher writes the defer off the loop, after the gate
@@ -573,9 +845,7 @@ class TestSpawnAdmissionGate:
                 )
                 store.accept([rec])
                 held = await mgr._admission.finish_parked_defer(_park("row1"))
-            deadline = time.monotonic() + 2.0
-            while not events and time.monotonic() < deadline:
-                await asyncio.sleep(0.01)
+            await _await_queued_event(events)
             return (missing, no_label_after_refusal), held
 
         (missing, no_label_after_refusal), held = asyncio.run(run())

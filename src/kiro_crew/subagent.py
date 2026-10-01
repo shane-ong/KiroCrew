@@ -216,6 +216,7 @@ from kiro_crew.subagent_wait_reasons import (  # noqa: F401 - re-exported: the g
     QUEUED_REASON_ADAPTIVE_CAP_ZERO,
     QUEUED_REASON_CONCURRENCY_LIMIT,
     QUEUED_REASON_LOW_MEMORY,
+    QUEUED_REASON_MEMORY_PRESSURE,
     QUEUED_REASON_POSTURE_CRITICAL,
 )
 from kiro_crew.validation import _AGENT_NAME_RE, is_registered_agent_name
@@ -2024,6 +2025,30 @@ def _live_dedicated(agents: list[SubagentInfo]) -> tuple[list[SubagentInfo], lis
     return live, [info for info in live if not info._session_sharing]
 
 
+def _unregistered_claims(live: list[SubagentInfo], running_count: int) -> int:
+    """Admitted claims whose run has not registered yet: slots counted, rows absent."""
+    return max(0, running_count - sum(not info._slot_released for info in live))
+
+
+def _owns_dedicated_runtime(agents: list[SubagentInfo], *, running_count: int) -> bool:
+    """Whether a dedicated subagent runtime of this gateway is running or warming.
+
+    The population :func:`_startup_memory_reserve_gb` prices -- a live row not
+    confirmed as shared, plus a claim admitted but not registered yet -- less a
+    row parked at the pre-execution spawn approval (``_awaiting_approval`` with
+    ``_exec_started`` still None): it has no process yet, and may never get one.
+    A row waiting on a mid-run tool prompt does have one, so it still counts.
+    The kernel memory-pressure hold applies only while this is True. With nothing
+    of ours running, the pressure is not ours to relieve, and holding would leave
+    a start waiting on an episode it can never end.
+    """
+    live, dedicated = _live_dedicated(agents)
+    running = any(
+        not (info._awaiting_approval and info._exec_started is None) for info in dedicated
+    )
+    return running or _unregistered_claims(live, running_count) > 0
+
+
 def _startup_memory_reserve_gb(
     agents: list[SubagentInfo],
     *,
@@ -2051,7 +2076,7 @@ def _startup_memory_reserve_gb(
     """
     live, dedicated = _live_dedicated(agents)
     cost = max(0.0, cost_gb)
-    unregistered = max(0, running_count - sum(not info._slot_released for info in live))
+    unregistered = _unregistered_claims(live, running_count)
     gaps = sum(
         max(0.0, cost - info.last_rss_gb)
         for info in dedicated
@@ -3303,6 +3328,11 @@ class SubagentManager:
         # own, and without this memory each re-emit would flip a memory-deferred
         # wave back to the default (concurrency) text.
         self._queue_wait: dict[str, dict[str, Any]] = {}
+        # The kernel memory-pressure level the gate last held a start at, or
+        # None once the level drops below WARN. A hold logs WARNING only when
+        # this changes, so a long pressure episode re-checking every queued row each
+        # admit wait logs one line per level, not one per row per pass.
+        self._pressure_hold_level: int | None = None
         # Rows the pump has popped from the window but not yet claimed. Their
         # durable state is still QUEUED, so without this set every store-backed
         # depth read between pop and claim counts them as waiting.

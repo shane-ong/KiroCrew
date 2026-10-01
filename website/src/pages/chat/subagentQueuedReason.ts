@@ -19,12 +19,16 @@ import { fmtUnit } from '../../i18n/format'
 import { i18nT } from '../../i18n/t'
 
 /** The gate's kinds. `concurrency_limit` clears on its own within seconds; the
- *  other three are deferrals re-checked every admit wait, possibly for hours. */
+ *  other four are deferrals re-checked every admit wait, possibly for hours.
+ *  `memory_pressure` is the macOS kernel's pressure verdict and carries no GB
+ *  figures: the free-memory figure cleared the floor, so numbers would
+ *  contradict it. */
 export type SubagentQueuedReasonKind =
   | 'concurrency_limit'
   | 'low_memory'
   | 'posture_critical'
   | 'adaptive_cap_zero'
+  | 'memory_pressure'
 
 export type SubagentQueuedReason = {
   reason: SubagentQueuedReasonKind
@@ -45,7 +49,7 @@ export type SubagentQueuedEvent = {
 }
 
 const KINDS: ReadonlySet<string> = new Set<SubagentQueuedReasonKind>([
-  'concurrency_limit', 'low_memory', 'posture_critical', 'adaptive_cap_zero',
+  'concurrency_limit', 'low_memory', 'posture_critical', 'adaptive_cap_zero', 'memory_pressure',
 ])
 
 const finiteOrUndefined = (v: unknown): number | undefined =>
@@ -93,6 +97,8 @@ export function queuedWaitText(reason: SubagentQueuedReason | undefined): string
         : i18nT('pages.chat.subagentQueued.posture_critical_no_figures')
     case 'adaptive_cap_zero':
       return i18nT('pages.chat.subagentQueued.adaptive_cap_zero')
+    case 'memory_pressure':
+      return i18nT('pages.chat.subagentQueued.memory_pressure')
     default:
       return null
   }
