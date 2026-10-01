@@ -59,7 +59,7 @@ import traceback
 import weakref
 from collections import deque
 from collections.abc import Callable, Collection, Iterator
-from contextlib import contextmanager
+from contextlib import AbstractContextManager, contextmanager
 from dataclasses import dataclass
 from functools import partial
 from pathlib import Path
@@ -541,7 +541,11 @@ def remove_unit(
                 unit_id,
             )
             return REMOVE_FAILED
-        failures, history_gone = _remove_unit_contents(directory)
+        # With this process's eager folder held between batches, so no fold has one of
+        # these files open: Windows refuses to unlink a file any handle holds, and a fold
+        # reads segments without the lease this removal holds.
+        with _eager_folder_paused():
+            failures, history_gone = _remove_unit_contents(directory)
         if failures:
             # Say WHICH of the two failures this is. Segments go first, so a
             # failure after some of them went is a PARTIAL removal -- that
@@ -1541,6 +1545,13 @@ def unit_opened_previous(kind: str, unit_id: str) -> "str | None":
         return None
     sid = previous.get("sid")
     return sid if isinstance(sid, str) and sid else None
+
+
+def _eager_folder_paused() -> "AbstractContextManager[bool]":
+    """:func:`eager.paused`, imported late: the eager folder imports this module."""
+    from kiro_crew.crew_log import eager
+
+    return eager.paused()
 
 
 def _remove_unit_contents(directory: Path) -> "tuple[int, int]":
@@ -2621,18 +2632,20 @@ class CrewLog:
             )
         path = segments[-1]
         header_path = segments[0]
-        with _open_lock(_lock_path(kind, unit_id)):
-            tail = _scan_tail(path)
-            if tail.torn_offset is not None:
-                dropped = path.stat().st_size - tail.torn_offset
-                _truncate(path, tail.torn_offset)
-                logger.warning(
-                    "dropped %d torn trailing byte(s) from %s crew log %r",
-                    dropped,
-                    kind,
-                    unit_id,
-                )
-            raw = _read_header_line(header_path)
+        # The lock guards one thing here: truncating a torn tail. A tail that ends
+        # in a complete line needs no write, so it is read without the lock. That
+        # matters because ``flock`` counts a sibling thread as a rival, and an
+        # acquire on the event-loop thread makes one attempt: with the eager folder
+        # opening this log on every entry, a locked open on the loop would be
+        # refused whenever the folder was mid-open. Append re-reads the tail under
+        # the lock, so a clean tail read here knows exactly what a locked read
+        # would have known once the lock was released. A tail that is torn or
+        # lacks its newline may be an append in flight, so that case takes the
+        # lock, which waits for the append, and reads again.
+        tail = _scan_tail(path)
+        if tail.torn_offset is not None or tail.needs_newline:
+            tail = cls._settle_tail(kind, unit_id, path)
+        raw = _read_header_line(header_path)
         parsed = None if not raw else _parses_to_object(raw)
         if parsed is None:
             raise CrewLogError(
@@ -2668,6 +2681,22 @@ class CrewLog:
             needs_newline=tail.needs_newline,
             lease_key=lease_key,
         )
+
+    @staticmethod
+    def _settle_tail(kind: str, unit_id: str, path: Path) -> _Tail:
+        """Re-read *path*'s tail under the lock, dropping torn trailing bytes."""
+        with _open_lock(_lock_path(kind, unit_id)):
+            tail = _scan_tail(path)
+            if tail.torn_offset is not None:
+                dropped = path.stat().st_size - tail.torn_offset
+                _truncate(path, tail.torn_offset)
+                logger.warning(
+                    "dropped %d torn trailing byte(s) from %s crew log %r",
+                    dropped,
+                    kind,
+                    unit_id,
+                )
+        return tail
 
     def repair_interrupted_turn(self, *, child_gone: "Callable[[str], bool] | None" = None) -> int:
         """Close an open turn on this crew log. Returns how many closers landed.

@@ -1319,6 +1319,69 @@ def test_a_torn_last_line_is_truncated_on_open():
     assert reopened.append("item/opened", {}, src="gateway").seq == 2
 
 
+def _hold_open_lock(kind: str, unit_id: str):
+    """Hold the log's open lock on another thread until the returned event is set."""
+    taken, release = threading.Event(), threading.Event()
+
+    def _hold() -> None:
+        with store._open_lock(store._lock_path(kind, unit_id)):
+            taken.set()
+            release.wait(5)
+
+    holder = threading.Thread(target=_hold, daemon=True)
+    holder.start()
+    assert taken.wait(5)
+    return release, holder
+
+
+def test_opening_a_clean_log_on_the_event_loop_is_not_refused_by_a_sibling_holder():
+    # The eager folder opens a session log on every entry from a worker thread.
+    # An open on the event-loop thread gets one lock attempt, so an open that
+    # locked even a clean tail was refused whenever the folder was mid-open.
+    import asyncio
+
+    crew = _crew()
+    crew.append("item/opened", {"kept": True}, src="gateway")
+    release, holder = _hold_open_lock(lg.KIND_CREW, CREW)
+    try:
+
+        async def _open_on_loop() -> int:
+            return CrewLog.open(lg.KIND_CREW, CREW).last_seq
+
+        assert asyncio.run(_open_on_loop()) == 1
+    finally:
+        release.set()
+        holder.join(5)
+
+
+def test_a_torn_tail_still_waits_for_the_lock_before_truncating():
+    # A torn tail may be an append in flight, so its open takes the lock and
+    # reads again: the holder finishing the line means nothing is dropped.
+    crew = _crew()
+    crew.append("item/opened", {"kept": True}, src="gateway")
+    path = lg.crew_log_path(lg.KIND_CREW, CREW)
+    intact = path.read_bytes()
+    finished = b'{"type":"item/opened","seq":2}\n'
+    path.write_bytes(intact + finished[:12])
+    taken, release = threading.Event(), threading.Event()
+
+    def _finish_under_lock() -> None:
+        with store._open_lock(store._lock_path(lg.KIND_CREW, CREW)):
+            taken.set()
+            release.wait(5)
+            path.write_bytes(intact + finished)
+
+    holder = threading.Thread(target=_finish_under_lock, daemon=True)
+    holder.start()
+    assert taken.wait(5)
+    threading.Timer(0.2, release.set).start()
+
+    CrewLog.open(lg.KIND_CREW, CREW)
+    holder.join(5)
+
+    assert path.read_bytes() == intact + finished
+
+
 def test_a_complete_last_line_missing_only_its_newline_is_kept():
     # Only the separator was lost, so the record is real; the next append
     # re-supplies the newline instead of rewriting the line.
