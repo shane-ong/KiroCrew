@@ -562,10 +562,10 @@ would otherwise clobber your pin.
 | `kirocrew-lite.json` | generated | every gateway start |
 | `kirocrew-guest.json` | generated | every gateway start (the tool-less agent a non-operator channel sender talks to) |
 | `kirocrew-worker.json` | DERIVED from `kirocrew.json` | every gateway start, and re-checked before every worker session |
-| `kirocrew-conductor.json` | generated | every gateway start |
-| `kirocrew-ledger-conductor.json` | generated | every gateway start |
-| `kirocrew-pipeline-conductor.json` | generated | every gateway start |
-| `kirocrew-security-conductor.json` | generated | every gateway start |
+| `kirocrew-conductor.json` | generated; your `allowedTools` entries are carried forward | every gateway start |
+| `kirocrew-ledger-conductor.json` | generated; your `allowedTools` entries are carried forward | every gateway start |
+| `kirocrew-pipeline-conductor.json` | generated; your `allowedTools` entries are carried forward | every gateway start |
+| `kirocrew-security-conductor.json` | generated; your `allowedTools` entries are carried forward | every gateway start |
 | `kirocrew-knowledge.json` | generated | every gateway start |
 | `kirocrew-research.json` | generated | every gateway start |
 | `kirocrew-heartbeat.json` | generated | every gateway start |
@@ -595,8 +595,55 @@ default agent no longer has. A project checkout shipping its own
 first, and Crew will neither rewrite a repository's tracked content nor honour
 it.
 
-What you may safely hand-edit: a spec you authored yourself, and in an owned or
-app-generated one, nothing — change `~/.kiro/crew/agent.json` or the Template pane instead.
+The four conductor specs are rewritten on every rebuild from their grant tuples,
+and one field of yours survives that: `allowedTools`. The installer reads the
+spec it is about to replace and carries your entries forward after the shipped
+grants, through the same governance ceiling the shipped grants pass
+(`agent_materialization/conductor_agents.py`, `_governed_grants`), so an entry
+you approved on `kirocrew-conductor.json` is still approved at the next start
+while an entry the ceiling forbids is still removed. What tells your entry apart
+from the installer's own is the history of every grant any release of Kiro Crew
+has ever shipped on that spec (`_SHIPPED_GRANT_HISTORY`, a table in the code
+that a test keeps complete): an entry on disk that history names is Crew's and
+comes back or goes with the current release — so a grant one release shipped and
+the next one stopped shipping is dropped rather than kept as yours — and an entry
+no release ever shipped is yours and stays. That holds for any file at the
+spec's name, whichever release or install wrote it, so an upgrade, a downgrade
+and re-upgrade, or a copied agents directory never costs you your entries. The
+one thing it cannot tell apart: a grant you add by hand that Crew once shipped
+and has since retired reads as Crew's and is dropped at the next start — named
+in the warning, recorded as a revoked auto-approval, and the tool asks instead.
+`kirocrew setup --agent-only --clean` drops your entries, as it drops every
+customization of `kirocrew.json`. A shipped grant you deleted comes back —
+narrow a conductor through the governance ceiling, not by editing the generated
+list — and nothing on the list moves silently: one warning in the gateway log
+names every entry a rebuild did not carry forward, a drop the ceiling did not
+make is recorded as a revoked auto-approval in the security event log, and an
+entry of yours that was carried forward is recorded there as a retained one. A
+spec that is present but cannot be read is handled by what the failure is. Bytes
+that can never be a spec — a JSON typo in your edit, an `allowedTools` that is
+not a list, a file past the read cap — are written over with a fresh spec, with
+one warning naming the cause and that nothing on the file was carried forward:
+kiro-cli could not have loaded that file either, so keeping it would have left
+you without the conductor (a session that names it would run the default agent
+instead) and left the ceiling with nothing to re-filter. A spec with a second
+hard link on it (a hardlink-based dotfile layout) is written over too, for the
+opposite reason: Kiro Crew's hardened reader refuses a multiply-linked file for
+good while kiro-cli loads it as it is, so leaving it in place would leave the one
+list kiro-cli reads out of the ceiling's reach. The rewrite replaces the name in
+the agents directory with a fresh file and never writes through the shared
+inode, so your other copy keeps its bytes; to carry your own entries across
+rebuilds, keep the spec a single-link regular file. A read that failed for a
+reason that may not recur — a permission or I/O error — leaves your file exactly
+where it is, with one warning naming the cause: repair it, or run
+`kirocrew setup --agent-only --clean` to rebuild it.
+(A link planted at the spec's name is written over the same way, with the
+warning saying nothing behind it was carried: that is what puts a loadable spec
+back.)
+
+What you may safely hand-edit: a spec you authored yourself; a conductor spec's
+`allowedTools`; and in any other owned or app-generated field, nothing — change
+`~/.kiro/crew/agent.json` or the Template pane instead.
 
 ## Markdown form and the Template pane
 

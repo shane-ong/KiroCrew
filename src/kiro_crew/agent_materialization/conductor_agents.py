@@ -11,9 +11,12 @@ each is judged by; the installers here read them from there.
 
 from __future__ import annotations
 
+import os
+from pathlib import Path
 from typing import Any
 
 from kiro_crew import agent as agent_mod
+from kiro_crew import agent_discovery
 from kiro_crew.agent_files import CONDUCTOR_AGENT_FILENAME as _CONDUCTOR_AGENT_FILENAME
 from kiro_crew.agent_files import (
     LEDGER_CONDUCTOR_AGENT_FILENAME as _LEDGER_CONDUCTOR_AGENT_FILENAME,
@@ -69,8 +72,406 @@ def _conductor_mcp_servers(config: dict[str, Any], *, work: bool = False) -> dic
     return narrowed
 
 
-def _conductor_spec(*, name: str, description: str, filename: str, source: str) -> dict[str, Any]:
-    """The conductor spec, emitted under *name* — one body, two filenames.
+# -- Every grant any release has shipped on the four conductor specs -------------
+#
+# THIS TABLE IS THE PROVENANCE. A generated conductor spec is rewritten on every
+# ``rebuild_agent_config``, and the file on disk is the only place a user's own
+# ``allowedTools`` entries live: nothing in the file says which entries the
+# installer wrote and which the user added. The history does: an on-disk entry
+# some release shipped on that spec is Crew's -- kept exactly when the current
+# release ships it, under the ceiling -- and an entry no release ever shipped is
+# the user's and survives. The one thing this cannot tell apart is a user who
+# hand-adds a grant Crew once shipped and has since retired: that entry reads as
+# Crew's and goes, loudly, and the tool it covered asks instead of being
+# auto-approved -- the direction a safety list fails in.
+#
+# Reconstructed from every commit of the installers since the first conductor:
+# the grant tuples and installer literals at each commit, resolved per spec (the
+# pull request body of the change that introduced this table lists each grant
+# with the change that shipped it and, where one did, the change that retired it).
+# LITERAL on purpose -- not derived from the current tuples -- because the list's
+# one job is to still name a grant after a release stops shipping it: derived
+# from the current tuples, a retired grant would leave the history the moment it
+# was retired and read as the user's, which is the very bug this module exists to
+# close. A test pins that every grant the installers write today is listed here,
+# so a NEW grant cannot land without being added; a retirement needs no step at
+# all, which is the direction a safety list wants.
+#
+# The core verbs that replaced the bare ``@kirocrew-core`` on the goal conductor;
+# the pipeline and security conductors shipped them from their first release,
+# without ``select_crew`` (they route nothing).
+_HISTORY_CORE_VERBS: frozenset[str] = frozenset(
+    {
+        "@kirocrew-core/monitor_start",
+        "@kirocrew-core/monitor_update",
+        "@kirocrew-core/autonudge_stop",
+        "@kirocrew-core/wait",
+        "@kirocrew-core/resource_status",
+        "@kirocrew-core/list_sessions",
+        "@kirocrew-core/session_ledger_read",
+        "@kirocrew-core/session_ledger_record",
+        "@kirocrew-core/skill_search",
+        "@kirocrew-core/skill_fetch",
+        "@kirocrew-core/send_message",
+        "@kirocrew-core/send_notification",
+        "@kirocrew-core/ask_question",
+    }
+)
+# The dashboard verbs every conductor ships: the folder/session reads and creates,
+# and ``session_status``. ``chat_folder_file_self`` is listed per spec below: the
+# pipeline conductor has never shipped it.
+_HISTORY_DASHBOARD_VERBS: frozenset[str] = frozenset(
+    {
+        "@kirocrew-dashboard/chat_folder_tree",
+        "@kirocrew-dashboard/chat_folder_create",
+        "@kirocrew-dashboard/session_create",
+        "@kirocrew-dashboard/session_read_message",
+        "@kirocrew-dashboard/session_status",
+    }
+)
+# The work-ledger verbs the goal conductor and the ledger alias ship. The two
+# ledger verbs were on the goal AND pipeline conductors for one release before the
+# ledger flow moved to its own spec, and came back to the goal conductor with
+# ``work_brief`` when it took the alias's spec over; ``work_report`` is the
+# WORKER's verb and no conductor has ever shipped it, so it is nobody's to drop.
+_HISTORY_WORK_VERBS: frozenset[str] = frozenset(
+    {
+        "@kirocrew-work/work_ledger_read",
+        "@kirocrew-work/work_ledger_record",
+        "@kirocrew-work/work_brief",
+    }
+)
+#: Spec name -> every ``allowedTools`` grant any release has shipped on it. Retired
+#: today: the goal conductor's bare ``@kirocrew-core``; the two work-ledger verbs
+#: the pipeline conductor shipped for one release. Beyond each spec's current
+#: tuple the table holds exactly those three entries (pinned by test), so an
+#: entry can join it only as a grant some release is shown to have shipped.
+_SHIPPED_GRANT_HISTORY: dict[str, frozenset[str]] = {
+    "kirocrew-conductor": (
+        frozenset({"session", "report", "tool_search", "@kirocrew-core"})
+        | _HISTORY_CORE_VERBS
+        | {"@kirocrew-core/select_crew"}
+        | _HISTORY_DASHBOARD_VERBS
+        | {"@kirocrew-dashboard/chat_folder_file_self"}
+        | _HISTORY_WORK_VERBS
+        | {"@kirocrew-work/work_ledger_rebuild"}
+    ),
+    "kirocrew-ledger-conductor": (
+        frozenset({"session", "report", "tool_search"})
+        | _HISTORY_CORE_VERBS
+        | {"@kirocrew-core/select_crew"}
+        | _HISTORY_DASHBOARD_VERBS
+        | {"@kirocrew-dashboard/chat_folder_file_self"}
+        | _HISTORY_WORK_VERBS
+        | {"@kirocrew-work/work_ledger_rebuild"}
+    ),
+    "kirocrew-pipeline-conductor": (
+        frozenset({"session", "report", "tool_search"})
+        | _HISTORY_CORE_VERBS
+        | _HISTORY_DASHBOARD_VERBS
+        | {"@kirocrew-work/work_ledger_read", "@kirocrew-work/work_ledger_record"}
+    ),
+    "kirocrew-security-conductor": (
+        frozenset({"session", "report", "tool_search"})
+        | _HISTORY_CORE_VERBS
+        | _HISTORY_DASHBOARD_VERBS
+        | {"@kirocrew-dashboard/chat_folder_file_self"}
+    ),
+}
+
+
+class _SpecUnusable(Exception):
+    """The spec at the installer's path exists and cannot be read as a spec.
+
+    ``replace`` says what the installer should do about it, and it follows the
+    reader's own two failure classes (:func:`agent_discovery.read_agent_spec_strict`):
+
+    ``True`` -- a path SHAPE identified before any read (a link planted at the
+    spec's name, a path that resolves outside the agents directory or to a
+    sensitive target, a dangling link, a second hard link on the spec's inode), or
+    bytes that are not a spec and will not become one on a re-read (not JSON, not
+    UTF-8, not an object, over the size cap, an ``allowedTools`` that is not a
+    list). Nothing loadable is preserved by leaving such bytes where they are:
+    kiro-cli cannot load them either, so a conductor dispatched by name would
+    resolve to the DEFAULT agent -- a file-writing tool set with its own
+    auto-approvals, in place of the deliberately file-tool-less conductor -- and a
+    tightened governance ceiling could never be re-filtered onto the one
+    ``allowedTools`` list that bypasses the PreToolUse gate. Writing a regular,
+    loadable file over them is what restores both; the entries the file may have
+    held could not be read and are named as lost. The hard-link alias is the one
+    shape kiro-cli WOULD load: the hardened reader refuses a multiply-linked inode
+    for good (no retry changes a link count), while kiro-cli reads the same bytes
+    without that fence, so a spec left in place for that reason would be the one
+    list a tightened ceiling never reaches. It is written over for the ceiling's
+    sake, and safely: ``_atomic_json_write`` swaps the directory entry for a fresh
+    inode, so the other name keeps its bytes untouched and nothing is written
+    through the shared inode.
+
+    ``False`` -- a read that failed for a reason the reader calls transient: a
+    permission or I/O error, a descriptor limit, a refused open. The bytes behind
+    it may be the user's intact spec and are never overwritten on a guess; the
+    file is left exactly where it is, the install reports that it did not write
+    it, and the next start reads it again.
+    """
+
+    def __init__(self, cause: str, *, replace: bool) -> None:
+        super().__init__(cause)
+        self.cause = cause
+        self.replace = replace
+
+
+def _spec_to_replace(path: Path) -> dict[str, Any] | None:
+    """The conductor spec on disk at *path*, ``None`` when there is none.
+
+    Read through the hardened reader that keeps the failure class
+    (:func:`agent_discovery.read_agent_spec_strict`), because this caller needs
+    to know WHY a read failed: an absent file is a first install and carries
+    nothing, a file that may read fine next time is left alone, and a file whose
+    bytes can never be a spec is written over (:class:`_SpecUnusable`). The
+    read-then-write-back fence every in-place spec rewriter applies
+    (``_spec_path_is_safe``) applies here too, so a link at the spec's name is
+    not followed into a copy-out.
+    """
+    agents_dir = agent_mod.kiro_agents_dir_path()
+    if not agent_mod._spec_path_is_safe(path, agents_dir):
+        raise _SpecUnusable(
+            "a link, or a path outside the agents directory, stands at the spec's name",
+            replace=True,
+        )
+    # The link count is a shape, read from the inode's metadata before any byte
+    # of it: a second hard link is permanent until someone unlinks it, so the
+    # hardened reader's refusal of it is not a read that may succeed later -- and
+    # kiro-cli, which does not apply that fence, would keep loading those bytes.
+    try:
+        links = os.lstat(path).st_nlink
+    except FileNotFoundError:
+        return None
+    except OSError:
+        links = 1  # the reader below classifies this failure
+    if links > 1:
+        raise _SpecUnusable(
+            "a second hard link shares the spec's inode (the other name keeps its "
+            "bytes; a spec kept as a single-link regular file carries its entries)",
+            replace=True,
+        )
+    try:
+        data = agent_discovery.read_agent_spec_strict(
+            path, operation="conductor_spec_regeneration", source="unknown"
+        )
+    except FileNotFoundError:
+        if os.path.lexists(path):
+            raise _SpecUnusable("a dangling link stands at the spec's name", replace=True)
+        return None
+    except OSError as exc:
+        # The reader's contract: a plain OSError is a read that MAY succeed on
+        # retry (permissions, I/O, a refused open), not a verdict on the bytes.
+        raise _SpecUnusable(str(exc), replace=False) from exc
+    except ValueError as exc:
+        # The reader's other class: the content is not a spec and a re-read will
+        # not change that (a sensitive target, over the cap, not UTF-8, not JSON).
+        raise _SpecUnusable(str(exc), replace=True) from exc
+    if not isinstance(data, dict):
+        raise _SpecUnusable("the document is not a JSON object", replace=True)
+    if "allowedTools" in data and not isinstance(data["allowedTools"], list):
+        raise _SpecUnusable("allowedTools is not a list", replace=True)
+    return data
+
+
+def _governed_grants(
+    shipped: tuple[str, ...], *, name: str, filename: str, source: str, clean: bool
+) -> list[str] | None:
+    """The ``allowedTools`` list a conductor installer writes: the shipped grants, then
+    the user's own entries on the spec it is about to replace, all under the ceiling.
+    ``None`` when the spec on disk must not be replaced at all (below).
+
+    Every ``rebuild_agent_config`` -- every gateway start, a provider switch, an MCP
+    change -- re-runs the installers. An installer that rebuilt this list from its
+    grant tuple alone and wrote the file without reading it would drop every
+    approval the user had added, at the next start, silently, while
+    ``toolsSettings`` carried over because nothing rewrites it. ``kirocrew.json``
+    keeps the user's ``tools`` / ``allowedTools`` on an existing install (ADD-only,
+    then the ceiling); this is that same merge, for the four conductor specs.
+
+    Which entries on disk are the USER'S is the whole question, and the file cannot
+    answer it: an entry is either the installer's or the user's and nothing in the
+    JSON says which. The history of every grant any release has shipped on this
+    spec (``_SHIPPED_GRANT_HISTORY``) answers it: an on-disk entry the history
+    names is Crew's and is re-derived from *shipped* -- kept exactly when this
+    release ships it -- and one it does not name is the user's and is carried
+    forward. Without that history an add-only merge would keep every grant an
+    earlier release shipped and this one deliberately does not -- the goal
+    conductor's core grant is named verbs where an earlier release's was a bare
+    ``@kirocrew-core``, and a narrowing like that reaches an existing install only
+    if the installer can tell its own earlier output from the user's. The worker
+    installer records the same objection and takes nothing but ``model`` from its
+    previous file for want of such a record; here the history is the record, so a
+    user's entry is kept and a retired grant still goes.
+
+    The provenance contract, then: an entry on disk is the user's exactly when no
+    release has ever shipped it on this spec. The history is kept in code rather
+    than in a per-install record because it holds for ANY file at the spec's name
+    -- one written by this release, by an earlier one (a downgrade and
+    re-upgrade), by another install whose agents directory was copied here, or by
+    a hand that edited an owned field -- with no second store to fall out of step
+    with the spec, be torn by a failed write, or be hand-damaged into a wrong
+    answer. What it costs is one case: a user who hand-adds a grant Crew once
+    shipped and has since retired (the bare ``@kirocrew-core`` an early goal
+    conductor shipped, the pipeline conductor's one-release work-ledger verbs)
+    loses it at the next start, named in the WARNING and the SEL feed, and the
+    tool it covered asks instead of being auto-approved -- the drop fails closed.
+    What the history cannot name is a grant a NEWER release ships: on an install
+    downgraded past it, that grant reads as the user's until the re-upgrade --
+    bounded to a grant some release of this project chose to ship, never to one
+    it retired. ``clean`` keeps nothing: ``kirocrew setup --agent-only --clean``
+    is the explicit reset, and it resets these specs as it resets
+    ``kirocrew.json``.
+
+    A spec that is present and cannot be read is not "no spec", and what happens
+    to it follows the reader's own two failure classes (``_SpecUnusable``). Bytes
+    that can never be a spec -- not JSON, not an object, an ``allowedTools`` that
+    is not a list, a planted or dangling link, a path outside the agents directory
+    -- are written over, because nothing loadable is preserved by keeping them:
+    kiro-cli would not load that file either, a conductor dispatched by name would
+    resolve to the DEFAULT agent and its file-writing tool set, and a tightened
+    ceiling could never be re-filtered onto the list. A second hard link on the
+    spec's inode is written over too, for the opposite reason: kiro-cli WOULD load
+    those bytes while the hardened reader refuses them for good, so a spec left in
+    place for that reason is the one list a tightened ceiling never reaches -- and
+    the write swaps the directory entry, so the other name keeps its bytes. The
+    WARNING names the cause and that no entry on the file was carried forward. A
+    read that failed for a reason the reader calls transient (a permission or I/O
+    error, a refused open) may stand before the user's intact spec, so that file
+    is left exactly where it is (``None``), named in the WARNING, and the
+    installer reports that it wrote nothing -- so a moved ceiling stays pending
+    and is retried, rather than being marked projected onto a list that was never
+    rewritten.
+
+    Order: *shipped* first, as shipped, then the user's entries, so the spec reads
+    as before for a user who added nothing and the tests that pin the shipped list
+    stay literal. A shipped grant the user deleted comes back: narrowing a
+    conductor is the governance ceiling's job (``POLICY ∩ PROFILE``), never a hand
+    edit's, and that ceiling is applied here to the WHOLE merged list through
+    ``_filter_auto_approve``, so a user's entry the ceiling forbids is withheld
+    (and SEL-audited) exactly as a shipped one is -- the merge never widens the
+    ceiling. Nothing on the list moves silently: one WARNING names every on-disk
+    entry this install did not carry forward, a drop the ceiling did not make is a
+    revoked auto-approval and lands in the SEL feed as one, and an entry of the
+    user's that IS carried forward lands there too, as a retained one -- the
+    decision that an auto-approval stays past a rebuild is a permission decision,
+    and the feed is where those are read.
+    """
+    on_disk: list[str] = []
+    if not clean:
+        path = agent_mod.kiro_agents_dir_path() / filename
+        try:
+            existing = _spec_to_replace(path)
+        except _SpecUnusable as exc:
+            agent_mod.logger.warning(
+                "%s: the spec on disk could not be read as a spec (%s); %s",
+                filename,
+                exc.cause,
+                (
+                    "written afresh from the shipped grants, so no entry on it is carried "
+                    "forward"
+                    if exc.replace
+                    else "left in place so your entries are not lost -- repair it, or run "
+                    "`kirocrew setup --agent-only --clean` to rebuild it"
+                ),
+            )
+            if not exc.replace:
+                return None
+            existing = None
+        if existing is not None:
+            # A non-string entry (a hand-edited file) is not a tool ref and would
+            # crash the ceiling predicate: neither kept nor reported as dropped.
+            on_disk = list(
+                dict.fromkeys(
+                    ref for ref in existing.get("allowedTools", []) if isinstance(ref, str)
+                )
+            )
+    # Crew's entries are every grant any release has shipped on this spec: a
+    # retired grant is Crew's and goes, and only an entry no release ever shipped
+    # is the user's.
+    crews = _SHIPPED_GRANT_HISTORY[name]
+    users_own = [ref for ref in on_disk if ref not in crews]
+    merged = (*shipped, *(ref for ref in users_own if ref not in shipped))
+    granted = auto_approve._filter_auto_approve(merged, source=source)
+    dropped = [ref for ref in on_disk if ref not in granted]
+    retained = [ref for ref in users_own if ref in granted]
+    if retained:
+        # The user's own auto-approvals, carried past a rebuild: the decision that
+        # a grant Kiro Crew did not ship stays in force is a permission decision
+        # and belongs in the SEL feed beside the withholds and revocations below,
+        # so an operator reading the feed sees every grant that outlived the
+        # rebuild and on whose authority. Best-effort: the audit must not break
+        # the install.
+        try:
+            agent_mod.sel().log_api_access(
+                caller="system",
+                operation="mcp_auto_approve_retained",
+                outcome="ok",
+                source=source,
+                resources=(
+                    f"{', '.join(retained)} auto-approval retained on {filename} "
+                    "(your own entry, shipped by no release of Kiro Crew)"
+                ),
+            )
+        except Exception:  # noqa: BLE001 — the audit must not break the install
+            agent_mod.logger.debug(
+                "SEL audit unavailable for retained conductor grant", exc_info=True
+            )
+    if not dropped:
+        return granted
+    agent_mod.logger.warning(
+        "%s: regeneration dropped allowedTools entries %s (withheld by the governance "
+        "ceiling, or shipped by an earlier release of Kiro Crew and no longer granted)",
+        filename,
+        ", ".join(dropped),
+    )
+    # An entry the ceiling withheld was offered to it inside ``merged`` and is already
+    # on the SEL feed from the filter; one that was never offered -- an earlier
+    # release's grant this one does not ship -- is an auto-approval this install
+    # REVOKED, which is a permission decision and belongs in the same feed.
+    # Best-effort: the audit must not break the install.
+    revoked = [ref for ref in dropped if ref not in merged]
+    if revoked:
+        try:
+            agent_mod.sel().log_api_access(
+                caller="system",
+                operation="mcp_auto_approve_revoked",
+                outcome="ok",
+                source=source,
+                resources=(
+                    f"{', '.join(revoked)} auto-approval removed from {filename} "
+                    "(shipped by an earlier release and not by this one)"
+                ),
+            )
+        except Exception:  # noqa: BLE001 — the audit must not break the install
+            agent_mod.logger.debug(
+                "SEL audit unavailable for revoked conductor grant", exc_info=True
+            )
+    return granted
+
+
+def _conductor_shipped_grants() -> tuple[str, ...]:
+    """The grants ``_conductor_spec`` ships, read once per install so the goal conductor
+    and its ledger alias merge against the same tuple."""
+    return (
+        "session",
+        "report",
+        "tool_search",
+        *agent_mod._CONDUCTOR_CORE_GRANTS,
+        *agent_mod._CONDUCTOR_DASHBOARD_GRANTS,
+        *agent_mod._LEDGER_CONDUCTOR_WORK_GRANTS,
+    )
+
+
+def _conductor_spec(
+    *, name: str, description: str, filename: str, source: str, clean: bool = False
+) -> dict[str, Any] | None:
+    """The conductor spec, emitted under *name* — one body, two filenames. ``None``
+    when the spec on disk is the user's and unreadable, and must be left in place
+    rather than replaced (``_governed_grants``).
 
     ``kirocrew-conductor`` and its deprecated alias
     ``kirocrew-ledger-conductor`` differ in ``name`` and ``description`` and in
@@ -80,8 +481,10 @@ def _conductor_spec(*, name: str, description: str, filename: str, source: str) 
     working — an alias that emits a DIFFERENT spec silently changes what that
     session can do. ``filename`` and ``source`` are the two per-installer
     values, and neither reaches the emitted JSON: ``filename`` names the KAS
-    ``agent_id`` used in the derive's log line, and ``source`` names the
-    installer in the withheld-grant audit event.
+    ``agent_id`` used in the derive's log line and the spec on disk whose user
+    entries are carried forward, and ``source`` names the installer in the
+    withheld-grant audit event. ``clean`` is the rebuild's own flag, passed
+    through: a clean rebuild carries nothing forward (``_governed_grants``).
 
     The charter, and why each property is a property of the SPEC rather than of
     the prompt. Derived from the kirocrew agent (resolved MCP invocations,
@@ -172,18 +575,16 @@ def _conductor_spec(*, name: str, description: str, filename: str, source: str) 
     # on the load rather than on the work. ``execute_bash`` stays withheld for
     # the reason recorded above it: ``allowedTools`` has no argument matching,
     # so trusting the one bundled script cannot be told apart from trusting
-    # arbitrary shell.
-    config["allowedTools"] = auto_approve._filter_auto_approve(
-        (
-            "session",
-            "report",
-            "tool_search",
-            *agent_mod._CONDUCTOR_CORE_GRANTS,
-            *agent_mod._CONDUCTOR_DASHBOARD_GRANTS,
-            *agent_mod._LEDGER_CONDUCTOR_WORK_GRANTS,
-        ),
-        source=source,
+    # arbitrary shell. Withheld, not forbidden: these are the grants Crew SHIPS.
+    # What the user approved on the spec on disk is carried forward beside them,
+    # through the same ceiling (``_governed_grants``) -- or, when that spec is
+    # theirs and cannot be read, left exactly where it is.
+    granted = _governed_grants(
+        _conductor_shipped_grants(), name=name, filename=filename, source=source, clean=clean
     )
+    if granted is None:
+        return None
+    config["allowedTools"] = granted
     config["mcpServers"] = _conductor_mcp_servers(config, work=True)
     # Derive the KAS policy from the FILTERED grant list instead of restating it
     # as a literal: the rules come out byte-identical, a later edit to
@@ -194,7 +595,7 @@ def _conductor_spec(*, name: str, description: str, filename: str, source: str) 
     return config
 
 
-def _install_conductor_agent() -> None:
+def _install_conductor_agent(*, clean: bool = False) -> bool:
     """Generate and install the kirocrew-conductor agent config.
 
     THE conductor: it owns a goal, and it tracks that goal in the work ledger.
@@ -210,8 +611,17 @@ def _install_conductor_agent() -> None:
     Every property ``_conductor_spec`` argues for holds here, and the swap did
     not relax one of them: no file-writing tool at all, ``@kirocrew-core`` /
     ``@kirocrew-dashboard`` / ``@kirocrew-work`` mounted whole and auto-approved
-    verb by verb, ``execute_bash`` mounted and never auto-approved, and the KAS
-    policy derived from the FILTERED grant list rather than restated.
+    verb by verb, ``execute_bash`` mounted and never auto-approved BY CREW, and
+    the KAS policy derived from the FILTERED grant list rather than restated.
+    The user's own auto-approve entries on the installed file are carried
+    forward under the ceiling (``_governed_grants``); ``clean`` is the rebuild's
+    flag and drops them, as it drops every customization of ``kirocrew.json``.
+
+    Returns whether the spec was written. ``False`` is the one non-raising path
+    that leaves the file untouched -- a spec on disk the installer could not read
+    for a reason that may clear on retry -- and the rebuild reads it so a moved
+    governance ceiling is not marked projected onto a list that was never
+    rewritten (``rebuild_agent_config``).
     """
     config = _conductor_spec(
         name="kirocrew-conductor",
@@ -224,11 +634,15 @@ def _install_conductor_agent() -> None:
         ),
         filename=_CONDUCTOR_AGENT_FILENAME,
         source="_install_conductor_agent",
+        clean=clean,
     )
+    if config is None:
+        return False
     agent_mod.kiro_agents_dir_path().mkdir(parents=True, exist_ok=True)
     path = agent_mod.kiro_agents_dir_path() / _CONDUCTOR_AGENT_FILENAME
     agent_mod._atomic_json_write(path, config)
     agent_mod.logger.info("Installed conductor agent config: %s", path)
+    return True
 
 
 #: Deprecated agent-spec name -> the current spec that replaced it.
@@ -246,7 +660,7 @@ DEPRECATED_AGENT_SPECS: dict[str, str] = {
 }
 
 
-def _install_ledger_conductor_agent() -> None:
+def _install_ledger_conductor_agent(*, clean: bool = False) -> bool:
     """Install the deprecated ``kirocrew-ledger-conductor`` alias spec.
 
     The ledger flow is ``kirocrew-conductor`` now, and this name is kept for one
@@ -255,7 +669,8 @@ def _install_ledger_conductor_agent() -> None:
     conductor, and what an operator typed into a cron. Deleting it in the same
     release as the swap would break those in place, so the name still resolves
     and emits the SAME spec — see ``_conductor_spec``, which both installers
-    call so the two cannot drift.
+    call so the two cannot drift. Its file is its own, so the user entries it
+    carries forward and the record it leaves are keyed by the alias name.
 
     Removed next release; nothing new should name it.
     """
@@ -271,14 +686,18 @@ def _install_ledger_conductor_agent() -> None:
         ),
         filename=_LEDGER_CONDUCTOR_AGENT_FILENAME,
         source="_install_ledger_conductor_agent",
+        clean=clean,
     )
+    if config is None:
+        return False
     agent_mod.kiro_agents_dir_path().mkdir(parents=True, exist_ok=True)
     path = agent_mod.kiro_agents_dir_path() / _LEDGER_CONDUCTOR_AGENT_FILENAME
     agent_mod._atomic_json_write(path, config)
     agent_mod.logger.info("Installed ledger-conductor alias agent config: %s", path)
+    return True
 
 
-def _install_pipeline_conductor_agent() -> None:
+def _install_pipeline_conductor_agent(*, clean: bool = False) -> bool:
     """Generate and install the kirocrew-pipeline-conductor agent config.
 
     Follows ``_install_conductor_agent`` above deliberately — one standalone
@@ -315,16 +734,23 @@ def _install_pipeline_conductor_agent() -> None:
         "@kirocrew-core",
         "@kirocrew-dashboard",
     ]
-    config["allowedTools"] = auto_approve._filter_auto_approve(
-        (
-            "session",
-            "report",
-            "tool_search",
-            *agent_mod._PIPELINE_CONDUCTOR_CORE_GRANTS,
-            *agent_mod._PIPELINE_CONDUCTOR_DASHBOARD_GRANTS,
-        ),
-        source="_install_pipeline_conductor_agent",
+    shipped = (
+        "session",
+        "report",
+        "tool_search",
+        *agent_mod._PIPELINE_CONDUCTOR_CORE_GRANTS,
+        *agent_mod._PIPELINE_CONDUCTOR_DASHBOARD_GRANTS,
     )
+    granted = _governed_grants(
+        shipped,
+        name="kirocrew-pipeline-conductor",
+        filename=_PIPELINE_CONDUCTOR_AGENT_FILENAME,
+        source="_install_pipeline_conductor_agent",
+        clean=clean,
+    )
+    if granted is None:
+        return False
+    config["allowedTools"] = granted
     config["mcpServers"] = _conductor_mcp_servers(config)
     # Same derive-don't-restate rationale as the conductor above; the shared
     # writer version-gates it.
@@ -335,9 +761,10 @@ def _install_pipeline_conductor_agent() -> None:
     path = agent_mod.kiro_agents_dir_path() / _PIPELINE_CONDUCTOR_AGENT_FILENAME
     agent_mod._atomic_json_write(path, config)
     agent_mod.logger.info("Installed pipeline-conductor agent config: %s", path)
+    return True
 
 
-def _install_security_conductor_agent() -> None:
+def _install_security_conductor_agent(*, clean: bool = False) -> bool:
     """Generate and install the kirocrew-security-conductor agent config.
 
     A third standalone installer, following ``_install_pipeline_conductor_agent``
@@ -398,16 +825,23 @@ def _install_security_conductor_agent() -> None:
         "@kirocrew-core",
         "@kirocrew-dashboard",
     ]
-    config["allowedTools"] = auto_approve._filter_auto_approve(
-        (
-            "session",
-            "report",
-            "tool_search",
-            *agent_mod._PIPELINE_CONDUCTOR_CORE_GRANTS,
-            *agent_mod._SECURITY_CONDUCTOR_DASHBOARD_GRANTS,
-        ),
-        source="_install_security_conductor_agent",
+    shipped = (
+        "session",
+        "report",
+        "tool_search",
+        *agent_mod._PIPELINE_CONDUCTOR_CORE_GRANTS,
+        *agent_mod._SECURITY_CONDUCTOR_DASHBOARD_GRANTS,
     )
+    granted = _governed_grants(
+        shipped,
+        name="kirocrew-security-conductor",
+        filename=_SECURITY_CONDUCTOR_AGENT_FILENAME,
+        source="_install_security_conductor_agent",
+        clean=clean,
+    )
+    if granted is None:
+        return False
+    config["allowedTools"] = granted
     config["mcpServers"] = _conductor_mcp_servers(config)
     # Derived from the FILTERED grant list rather than restated, so a ceiling
     # that strips a grant strips its KAS rule with it; the shared writer
@@ -419,3 +853,4 @@ def _install_security_conductor_agent() -> None:
     path = agent_mod.kiro_agents_dir_path() / _SECURITY_CONDUCTOR_AGENT_FILENAME
     agent_mod._atomic_json_write(path, config)
     agent_mod.logger.info("Installed security-conductor agent config: %s", path)
+    return True
