@@ -87,51 +87,19 @@ Instead of Jev, decisions can be answered by an open-weight model running on you
 
 "Accuracy vs Jev" is how many of Jev's correct answers the model also got right on the 231 public items of [JevBench](https://github.com/fstandhartinger/jevbench), measured on a 10-core CPU with no GPU. A machine below 12 GB is better served by hosted Jev, and the card recommends it there.
 
-A local model is slower than Jev, and each decision point waits only a few seconds for an answer. A slower answer is skipped and the point does what it does without Jev, so a slow model makes fewer decisions, not worse ones. Two points do wait in front of you: picking the model for a turn, and placing a message you send mid-turn. With Plumb-4B each can add up to 5 seconds, and up to 2 seconds with Laya. The accuracy figures on the card were measured with no time limit, and the answers that take longest are mostly the hard ones, so treat them as an upper bound: with its 5-second limit, Plumb-4B skips many of the long, hard decisions its "hard" figure counts. Plumb-4B is the better choice for the background points (risky tool calls, recalled memories, compaction scoring); Laya is fast enough for everything but misses more of the hard judgements.
+A local model is slower than Jev, and each decision point waits only a few seconds for an answer. A slower answer is skipped and the point does what it does without Jev, so a slow model makes fewer decisions, not worse ones. Two points do wait in front of you: picking the model for a turn, and placing a message you send mid-turn. With Plumb-4B each can add up to 5 seconds, and up to 2 seconds with Laya. The accuracy figures on the card were measured with no time limit, and the answers that take longest are mostly the hard ones, so treat them as an upper bound: with its 5-second limit, Plumb-4B skips many of the long, hard decisions its "hard" figure counts. To stop a local model, pick **No model** and press **Use this model**: nothing is sent, the server stops, and every decision uses the built-in rules. Plumb-4B is the better choice for the background points (risky tool calls, recalled memories, compaction scoring); Laya is fast enough for everything but misses more of the hard judgements.
 
-You install and start the model's server yourself; Kiro Crew only sends it requests. Use a separate Python 3.12 virtual environment for each.
+You do not install or start anything yourself. When you press **Use this model**, Kiro Crew does it and the card shows each step:
 
-**Plumb-4B.** Its serving package assumes a GPU, so it is started through a short launcher:
+1. **Download.** The model files come from Kiro Crew's own model CDN: about 8.4 GB for Plumb-4B, about 0.85 GB for Laya, which keeps only its English checkpoint. Each file is checked against a SHA-256 fixed in Kiro Crew before it is used, so a changed file is refused rather than run. An interrupted download resumes where it stopped.
+2. **Install.** A Python 3.12 environment of about 1 GB is built for the model with `uv`, from a lock that pins every package to the version the card's figures were measured with. On Linux, PyTorch comes from its CPU-only index. This happens once per model and takes a few minutes.
+3. **Start.** The model's server starts in the background, sandboxed, and listens on `127.0.0.1` only. The card says **Running on this machine** once it answers.
 
-```bash
-python3.12 -m venv ~/plumb && source ~/plumb/bin/activate
-pip install "jevk5 @ git+https://github.com/allebee/jevk5@85238d7be5527370c43206fe54cd752eb3134c1b"
-cat > plumb_serve_cpu.py <<'PY'
-import argparse
-from http.server import ThreadingHTTPServer
-
-import torch
-from huggingface_hub import snapshot_download
-from jevk5.runtime import JevK5
-from jevk5.server import make_handler
-
-p = argparse.ArgumentParser()
-p.add_argument("--port", type=int, default=8102)
-a = p.parse_args()
-weights = snapshot_download(
-    "crh225/plumb-4b", revision="24f7bf77e7ee258a2d158c61ea2dce2b60321010"
-)
-model = JevK5(weights, device="cpu", dtype=torch.bfloat16, graphs=False)
-ThreadingHTTPServer(("127.0.0.1", a.port), make_handler(model, "crh225/plumb-4b")).serve_forever()
-PY
-python plumb_serve_cpu.py --port 8102
-```
-
-The first start downloads about 8 GB of weights. Both the package and the weights are pinned to the exact commits the card's figures were measured with (`v0.2.0` of `jevk5`; the weights are unchanged since the `Plumb-4B v5` commit), so a later push to either repository cannot change what runs. Laya is pinned to its PyPI release.
-
-**Laya.**
-
-```bash
-python3.12 -m venv ~/laya && source ~/laya/bin/activate
-pip install "laya[serve]==0.3.22"
-LAYA_HOST=127.0.0.1 LAYA_PORT=8104 LAYA_DEVICE=cpu laya-serve
-```
-
-Keep the server bound to `127.0.0.1`. Then choose the model on the card and press **Use this model**; change the port there if you started the server on another one.
+The weights, with their license and notice files, live under `~/.kiro/crew/decisions/models/<model>/`; the model's software and its log live under `~/.kiro/crew/models/decisions/<model>/`. The server runs for as long as Kiro Crew does: it stops when you switch to another model and when the gateway exits, and starts again when the gateway does. If it exits on its own it is restarted a few times; if it keeps failing, the card shows why, with the end of the server's log, and a **Try again** button. **Remove download** under a model you are not using deletes its files and environment to give the disk space back.
 
 What changes when you switch:
 
-- The card writes `provider.endpoint` as `http://127.0.0.1:<port>/v1/systemone`, together with the model and a longer `timeout_ms`. It never takes an address from you, so the dashboard cannot be used to send decisions somewhere else.
+- The card writes `provider.endpoint` as `http://127.0.0.1:<port>/v1/systemone`, together with the model and a longer `timeout_ms`. Kiro Crew picks the port: the model's usual one, or a free one when something else holds it. The card never takes an address or a port from you, so the dashboard cannot be used to send decisions somewhere else.
 - **Your Jev API key is not sent** to a local address. Only a literal loopback address counts as local: an address written with the name `localhost` is treated like any other server and gets the key.
 - If the Decisions switch was on, it stays on for the local address. Switching back to Jev does the opposite: nothing is sent until you turn the switch off and on again, because that is the direction that starts sending to TypeSafe.
 
