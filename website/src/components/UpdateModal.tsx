@@ -1,9 +1,11 @@
 import { useEffect, useState } from 'react'
-import { useQuery, useMutation } from '@tanstack/react-query'
+import { useQuery } from '@tanstack/react-query'
 import { AlertTriangle, Download, Loader2, X } from 'lucide-react'
 
 import { i18nT } from '../i18n/t'
 import type { UpdateState } from '../hooks/useUpdateSubscription'
+import { useInstallDispatch } from '../hooks/useInstallDispatch'
+import ErrorNotice from './ErrorNotice'
 /**
  * In-app "update ready" modal for the packaged desktop app.
  *
@@ -23,10 +25,6 @@ import type { UpdateState } from '../hooks/useUpdateSubscription'
  * the Electron preload), so it's safe to mount unconditionally in App.
  */
 
-function getUpdateApi(): UpdateAPI | undefined {
-  return window.updateAPI
-}
-
 export default function UpdateModal() {
   const { data: update } = useQuery<UpdateState | null>({
     queryKey: ['update-state'],
@@ -45,35 +43,9 @@ export default function UpdateModal() {
     setDismissed(false)
   }
 
-  const installMutation = useMutation({ mutationFn: () => getUpdateApi()!.install() })
-  // install() resolves as soon as the install is DISPATCHED — on macOS the
-  // platform installer then works for several seconds before the app quits.
-  // Keying `disabled` on `isPending` alone lets the button re-arm during that
-  // window, so the user sees a clickable install-and-restart action followed by an
-  // unexplained quit — which reads as a crash.
-  const installing = installMutation.isPending || installMutation.isSuccess
-
-  // A dispatched install normally ends in the app quitting, so isSuccess is a
-  // fine proxy for "about to restart" -- EXCEPT when the main process aborts
-  // the handoff (stage invalidated mid-dispatch) and the app keeps running.
-  // Without a reset, the stale isSuccess keeps `installing` true forever: the
-  // next downloaded version reopens this modal with every button disabled and
-  // no way out short of a reload. The dispatch is only "still live" while the
-  // state is 'installing' or 'downloaded' FOR THE VERSION the user clicked
-  // (tracked below) -- keying on the version matters because the IPC
-  // resolution can land after the abort/supersede states have already been
-  // pushed, at which point a bare state check reads the NEW version's
-  // 'downloaded' as the old dispatch still running.
-  const [installFor, setInstallFor] = useState<string | undefined>(undefined)
-  const state = update?.state
-  const stateVersion = update?.version
-  useEffect(() => {
-    if (!installMutation.isSuccess) return
-    const dispatchStillLive = state === 'installing'
-      || (state === 'downloaded' && stateVersion === installFor)
-    if (!dispatchStillLive) installMutation.reset()
-    // eslint-disable-next-line react-hooks/exhaustive-deps -- reset identity is stable; keying on state transition
-  }, [state, stateVersion, installFor, installMutation.isSuccess])
+  // Install-and-restart, with its one-way latch and the reset for a refused or
+  // aborted handoff (see useInstallDispatch).
+  const { installMutation, dispatched: installing, dispatchInstall } = useInstallDispatch(update)
 
   const open = !!update && update.state === 'downloaded' && !update.replayed && !dismissed
 
@@ -191,6 +163,22 @@ export default function UpdateModal() {
             {i18nT('components.updateModal.install_restart_timing')}
             {showsWindowsInstaller && ` ${i18nT('components.updateModal.windows_installer_handoff')}`}
           </p>
+          {/* The install IPC itself rejected (the main process threw before any
+              update state was pushed), so nothing else on screen reports it and
+              the button simply re-arms. askAgent on: the modal holds no draft, and
+              the hand-off closes it so the chat it opens is visible. */}
+          {installMutation.isError && (
+            <div className="mt-2">
+              <ErrorNotice
+                variant="inline"
+                title={i18nT('components.updateModal.install_failed')}
+                message={i18nT('pages.settings.aboutPanel.update_error_install_unknown')}
+                askAgent
+                onHandoff={() => setDismissed(true)}
+                testId="update-modal-install-error"
+              />
+            </div>
+          )}
         </div>
 
         <div className="flex items-center justify-end gap-2 px-4 py-2.5 border-t border-border bg-bg-elevated">
@@ -205,7 +193,7 @@ export default function UpdateModal() {
           <button
             type="button"
             className="px-3 py-1.5 text-sm rounded-md bg-accent text-accent-fg hover:opacity-90 cursor-pointer disabled:opacity-50"
-            onClick={() => { setInstallFor(update!.version); installMutation.mutate() }}
+            onClick={dispatchInstall}
             disabled={installing}
           >
             {installing ? i18nT('components.updateModal.restarting') : i18nT('components.updateModal.restart_update')}
