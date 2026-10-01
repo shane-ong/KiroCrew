@@ -202,7 +202,7 @@ export function DecisionsPointPanel({
           />
           <SettingsSelect
             label={i18nT('pages.developer.featurePreviewsTab.decisions_judge_model')}
-            description={i18nT('pages.developer.featurePreviewsTab.decisions_judge_model_desc')}
+            hint={i18nT('pages.developer.featurePreviewsTab.decisions_judge_model_desc')}
             configKey={DECISIONS_NUDGE_WAKE_MODEL_PATH}
             value={judgeModel}
             options={judgeModelOptions}

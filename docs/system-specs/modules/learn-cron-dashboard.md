@@ -3334,11 +3334,13 @@ Shared `AgentSelector` component (`website/src/components/AgentSelector.tsx`) us
 
 ### InfoTip Component
 
-Reusable `?` button (`website/src/components/InfoTip.tsx`) for contextual help across all pages:
+Reusable info glyph (`website/src/components/InfoTip.tsx`, a lucide `Info` icon) for contextual help across all pages — the one pattern for prose a reader wants once, not on every visit:
 - Portal-rendered to `document.body` — escapes `overflow: hidden` on `card-glow` parents
 - `fixed` positioning with viewport-aware placement
 - Solid background (`var(--card)`), strong shadow, `z-[9999]`
-- Click to toggle, outside-click to close
+- Mouse: hover shows the tip; leaving the glyph or the bubble hides it after a short grace (`HOVER_LEAVE_GRACE_MS`), so the pointer can cross onto the bubble to read or copy a long tip. Keyboard: focus shows it, Escape hides it, blur hides it. Touch: a tap pins it, another tap or a tap elsewhere unpins it. A click pins on any input. Hover is a mouse affordance only (`pointerType === 'mouse'`), so the synthetic enter a tap fires cannot race the click that pins
+- The glyph's accessible NAME is the short generic `More information`; the tip text is its DESCRIPTION — `aria-describedby` points at the visible `role="tooltip"` while shown, and while hidden the same text sits on `title`, the native fallback assistive technology also reads as a description. Nothing of the tip is body copy until it opens, and `title` is dropped the moment it does, so the browser's own tooltip never doubles ours
+- Settings rows (`website/src/components/settings.tsx`): `description` is for the sentence needed to MAKE the choice — a consequence, a cost, where data goes, a status — and stays on the row; everything that only explains what the control is goes in `hint`, which renders this tip beside the label. The settings-registry extractor indexes the `hint` text for palette search when a row keeps no `description`. The bubble is placed on whichever side of the glyph has more room and capped (`max-h`, scrolling) to that room, so a long tip is never clipped off-screen
 - Used on: Sessions (Chat), Preferences/Lessons/Cron/Skills/MCP (Overview), AIM/Agents/Context/Usage (Agents), Task Runner (Tasks), Process (System)
 
 ### MCP Info Button (Chat)
