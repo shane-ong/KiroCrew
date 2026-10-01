@@ -6593,9 +6593,23 @@ class GatewayOrchestrator:
                     return None
                 # Attempt one retry for ACP process death before any dedup / alert.
                 exc_msg = str(exc).lower()
+                # Set when the ACP retry below ran and failed. Its attempt may
+                # have dispatched, so the transient ladder must not run again.
+                _acp_retry_failed = False
                 if (
-                    isinstance(exc, AcpError)
-                    and ("not running" in exc_msg or "process exited" in exc_msg)
+                    # Match the death by type: the pipe-broken raise sites in
+                    # acp/client.py word it "pipe broken", which no substring
+                    # below covers. The typed arm is held to before dispatch,
+                    # where no tool can have run yet. A failed retry skips the
+                    # transient ladder, so one run never dispatches twice.
+                    # The substrings keep their old reach.
+                    (
+                        (isinstance(exc, AcpProcessDied) and not _prompt_dispatched)
+                        or (
+                            isinstance(exc, AcpError)
+                            and ("not running" in exc_msg or "process exited" in exc_msg)
+                        )
+                    )
                     and not getattr(job, "_acp_retried", False)
                     and self.sessions is not None
                 ):
@@ -6620,7 +6634,7 @@ class GatewayOrchestrator:
                         _needs_reinjection = False
                         return await _cron_callback(job)
                     except Exception:
-                        pass  # retry failed — fall through to dedup + alert
+                        _acp_retry_failed = True  # fall through to dedup + alert
                     finally:
                         job._acp_retried = False  # type: ignore[attr-defined]
                 # ── Transient backend errors: retry the whole callback with ──
@@ -6640,7 +6654,7 @@ class GatewayOrchestrator:
                 # of the outermost invocation only, and the recursive call
                 # re-enters the full callback so a retry that succeeds runs
                 # the complete delivery path.
-                if acp_error_is_transient(exc) and not _prompt_dispatched:
+                if acp_error_is_transient(exc) and not _prompt_dispatched and not _acp_retry_failed:
                     _t_attempt = getattr(job, "_transient_attempts", 0)
                     if _t_attempt < _CRON_TRANSIENT_RETRIES:
                         job._transient_attempts = _t_attempt + 1  # type: ignore[attr-defined]
