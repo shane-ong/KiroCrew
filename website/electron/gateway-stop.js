@@ -240,6 +240,40 @@ function postShutdown({
   })();
 }
 
+function pidIsAlive(pid, signalPidFn) {
+  try { signalPidFn(pid, 0); return true; } catch { return false; }
+}
+
+/**
+ * After the child exits, stop any descendant listed before its SIGTERM that is
+ * still alive and still a gateway -- the gateway a launcher shim forked. It
+ * gets SIGTERM (its own handler flushes state), then SIGKILL at `deadline`.
+ * Identity is re-read right before each signal, so a pid that exited and was
+ * reused by an unrelated process is never signalled.
+ */
+async function stopForkedGatewaySurvivors(pids, { deadline, getCommandFn, signalPidFn, pollMs }) {
+  const stillGateway = async (pid) => {
+    if (!pidIsAlive(pid, signalPidFn)) return false;
+    try { return isKirocrewCommand(await getCommandFn(pid)); } catch { return false; }
+  };
+  // Validate and signal each pid in the same step: no other pid's identity
+  // read (a /bin/ps spawn) may sit between this pid's check and its signal.
+  let survivors = [];
+  for (const pid of pids) {
+    if (!(await stillGateway(pid))) continue;
+    try { signalPidFn(pid, "SIGTERM"); survivors.push(pid); } catch {}
+  }
+  if (!survivors.length) return;
+  while (Date.now() < deadline) {
+    survivors = survivors.filter((pid) => pidIsAlive(pid, signalPidFn));
+    if (!survivors.length) return;
+    await new Promise((r) => { setTimeout(r, pollMs); });
+  }
+  for (const pid of survivors) {
+    if (await stillGateway(pid)) { try { signalPidFn(pid, "SIGKILL"); } catch {} }
+  }
+}
+
 /**
  * Stop the gateway child gracefully and await its exit.
  *   1. POST /api/shutdown (clean flush + self-exit)
@@ -263,6 +297,20 @@ function postShutdown({
  * the only correct step-2 there. This mirrors the backend, which routes its own
  * stop path through platform_compat.kill_process_tree for exactly this reason.
  *
+ * WHY POSIX LISTS THE TREE. The child may be a launcher shim that FORKED the
+ * real gateway instead of exec'ing it (a package manager can install the
+ * command that way). SIGTERM then reaches only the shim: it dies, its 'exit'
+ * fires, and the gateway lives on re-parented to init, holding the port and
+ * the lock. So, when the caller supplies the probes, the tree is listed BEFORE
+ * the signal re-parents it. SIGTERM still goes to the child alone -- a real
+ * gateway reaps its own children on SIGTERM, so the graceful path is
+ * unchanged. Once the child is gone, any listed descendant that is still alive
+ * AND still reads as a gateway command is the forked gateway: it gets its own
+ * SIGTERM, then SIGKILL at the deadline. Other leftovers (kiro-cli, MCP) are
+ * not touched here; the backend's own orphan sweep owns them. The SIGKILL
+ * escalation of a child that outlived the deadline signals the whole listed
+ * tree, as wedge recovery does.
+ *
  * @param {import("child_process").ChildProcess} proc
  * @param {object} opts
  * @param {string} [opts.platform] process.platform override (tests)
@@ -273,6 +321,13 @@ function postShutdown({
  *   fit inside this function's deadline — it is awaited, never pre-empted, since
  *   cutting it short would kill the parent alone and orphan the very descendants
  *   it exists to reap.
+ * @param {(pid:number) => Promise<number[]>} [opts.listDescendantsFn] POSIX:
+ *   every live descendant of pid, deepest first. With getCommandFn, turns on
+ *   the shim handling above; without either, POSIX signals the child alone.
+ * @param {(pid:number) => Promise<string>} [opts.getCommandFn] POSIX: a pid's
+ *   command line, used to confirm a survivor is a gateway before signalling it.
+ * @param {(pid:number, signal:string|number) => void} [opts.signalPidFn]
+ *   process.kill, injectable for tests.
  * @returns {Promise<void>}
  */
 async function stopGatewayGracefully(
@@ -288,10 +343,22 @@ async function stopGatewayGracefully(
     pathMod,
     platform = process.platform,
     killTreeFn = null,
+    listDescendantsFn = null,
+    getCommandFn = null,
+    signalPidFn = (pid, signal) => process.kill(pid, signal),
+    survivorPollMs = 200,
   } = {}
 ) {
   if (!proc || proc.exitCode !== null) return;
   const useTreeKill = platform === "win32" && typeof killTreeFn === "function";
+  const listsTree = platform !== "win32"
+    && typeof listDescendantsFn === "function"
+    && typeof getCommandFn === "function";
+  const deadline = Date.now() + timeoutMs;
+  // The tree as it stood just before SIGTERM, and the listing in flight. Kept
+  // outside the executor so the survivor sweep below can read them.
+  let termSnapshot = [];
+  let listingInFlight = null;
   // In-flight tree kill, awaited before this function reports the gateway gone.
   // taskkill /T terminates the PARENT first and then walks the rest of the tree, so
   // the process 'exit' event fires while descendants are still being reaped —
@@ -323,8 +390,18 @@ async function stopGatewayGracefully(
       const killPid = () => {
         if (proc.exitCode === null) { try { proc.kill(signal); } catch {} }
       };
-      if (!useTreeKill) { killPid(); return; }
-      treeKillInFlight = killTreeFn(proc.pid).catch(killPid);
+      if (useTreeKill) { treeKillInFlight = killTreeFn(proc.pid).catch(killPid); return; }
+      if (!listsTree || !proc.pid) { killPid(); return; }
+      // List BEFORE signalling: the signal re-parents the tree to init.
+      listingInFlight = Promise.resolve()
+        .then(() => listDescendantsFn(proc.pid))
+        .catch(() => [])
+        .then((pids) => {
+          const listed = Array.isArray(pids) ? pids : [];
+          if (signal === "SIGTERM") termSnapshot = listed;
+          else for (const pid of listed) { try { signalPidFn(pid, signal); } catch {} }
+          killPid();
+        });
     };
     // Escalate at timeoutMs but DON'T resolve here — wait for the real 'exit' so
     // callers are guaranteed the process is gone (and signalCode is accurate). A
@@ -354,6 +431,14 @@ async function stopGatewayGracefully(
   // kill's own timeouts to fit inside timeoutMs (see main.js), so in practice this
   // adds only the sweep's remaining tail; the race is the backstop for when that
   // sizing is wrong.
+  if (listingInFlight) {
+    await Promise.race([listingInFlight, new Promise((r) => { setTimeout(r, timeoutMs); })]);
+  }
+  if (termSnapshot.length) {
+    await stopForkedGatewaySurvivors(termSnapshot, {
+      deadline, getCommandFn, signalPidFn, pollMs: survivorPollMs,
+    });
+  }
   if (treeKillInFlight) {
     await Promise.race([
       treeKillInFlight,
