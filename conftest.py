@@ -102,6 +102,7 @@ from __future__ import annotations
 import asyncio
 import asyncio.base_events
 import atexit
+import concurrent.futures
 import contextlib
 import functools
 import gc
@@ -1818,6 +1819,112 @@ def _join_test_loop_executor(item) -> None:
         return
 
 
+#: Single-worker, fire-and-forget writers whose queued jobs resolve the data home when
+#: they RUN, as ``(module, the module global holding its lazily built pool, a predicate
+#: answering whether that module has nothing outstanding)``. The member event log's
+#: ``eventlog-io`` worker resolves each member log's path from ``KIROCREW_HOME`` as the
+#: append executes, and the dashboard's ``notif-io`` worker resolves the notifications
+#: file the same way, so a job still queued when a test ends writes into the NEXT test's
+#: home. Why the drain is the floor's half rather than the whole fix:
+#: docs/system-specs/common/testing-conventions.md § Determinism 4.
+#:
+#: The predicate exists because a FIFO barrier alone can OVERTAKE a submission: a caller
+#: inside ``eventlog_hooks.submit`` has taken its reservation and not yet reached
+#: ``pool.submit``, so its append is counted in ``_reserved`` and absent from the queue --
+#: and a barrier queued meanwhile completes ahead of it. ``None`` for a module with no
+#: such bookkeeping, where the barrier is all there is.
+def _eventlog_hooks_quiescent(mod) -> bool:
+    """Whether ``eventlog_hooks`` holds no append, reserved or queued.
+
+    Under the module's OWN lock, and that is the whole point: ``submit`` moves a
+    reservation into ``_inflight`` in two steps (``_reserved += 1``, then after
+    ``pool.submit`` returns, ``_inflight.add`` and ``_reserved -= 1``), so two unlocked
+    reads can land either side of that handover and see an empty set AND a zero count
+    while an append is outstanding -- which is the exact window this predicate exists to
+    close. ``drain_for_shutdown`` snapshots the pair the same way.
+    """
+    with mod._inflight_lock:
+        return not mod._inflight and not mod._reserved
+
+
+_FIRE_AND_FORGET_POOLS = (
+    ("kiro_crew.eventlog_hooks", "_io_pool", _eventlog_hooks_quiescent),
+    ("kiro_crew.dashboard.state", "_notification_io_pool", None),
+)
+
+#: Module name -> the barrier that did not finish within the join. The worker behind it
+#: is wedged, and a FIFO single worker cannot run anything queued after it, so a later
+#: teardown skips that pool rather than waiting the join out again on every test.
+_wedged_writer_barriers: "dict[str, concurrent.futures.Future]" = {}
+
+#: How long to wait between two looks at a module that still reports outstanding work.
+_WRITER_RESERVATION_POLL_SECS = 0.005
+
+
+def _writers_quiescent(module, predicate) -> bool:
+    """Whether *module* reports nothing outstanding. Unknown counts as quiescent.
+
+    A test is free to replace the counters this reads, so the answer is advisory: it
+    only decides whether the barrier below needs to be submitted AGAIN, never whether
+    the drain happens at all.
+    """
+    if predicate is None:
+        return True
+    try:
+        return bool(predicate(module))
+    except Exception:  # pragma: no cover - a test replaced the bookkeeping
+        return True
+
+
+def _drain_fire_and_forget_writers() -> None:
+    """Let every queued job on those writers finish before this test's pins lift.
+
+    Each pool has ONE worker that runs jobs in submission order, so a no-op submitted
+    now completes only after everything already queued: waiting on it drains the queue
+    without depending on the module's own bookkeeping, which a test may have
+    monkeypatched. The pool attribute is read directly for the same reason -- the
+    factory functions are what tests replace. The module's outstanding counts are then
+    consulted to close the reserved-but-not-yet-queued window, and the barrier is
+    submitted again while they say work remains.
+
+    Same place and same reason as :func:`_join_install_receipt_workers`: before any
+    fixture teardown, so the home pin and the test's ``tmp_path`` still exist. A module
+    that was never imported, or a pool never built, costs a dict lookup.
+    """
+    for module_name, attr, predicate in _FIRE_AND_FORGET_POOLS:
+        # PER POOL, not one budget shared across the table: a first pool that spends the
+        # whole join would otherwise hand the next one a zero timeout, and the queued
+        # write it was meant to drain then runs after the pins lift anyway.
+        deadline = time.monotonic() + _EXECUTOR_JOIN_SECS
+        module = sys.modules.get(module_name)
+        pool = getattr(module, attr, None)
+        if pool is None:
+            continue
+        wedged = _wedged_writer_barriers.get(module_name)
+        if wedged is not None and not wedged.done():
+            continue
+        while True:
+            try:
+                barrier = pool.submit(lambda: None)
+            except Exception:  # pragma: no cover - a pool a test shut down or replaced
+                _wedged_writer_barriers.pop(module_name, None)
+                break
+            remaining = deadline - time.monotonic()
+            try:
+                barrier.result(timeout=max(remaining, 0.0))
+            except concurrent.futures.TimeoutError:
+                _wedged_writer_barriers[module_name] = barrier
+                break
+            _wedged_writer_barriers.pop(module_name, None)
+            if _writers_quiescent(module, predicate):
+                break
+            if time.monotonic() >= deadline:
+                # Work keeps arriving faster than it drains, which is a wedged or
+                # runaway producer rather than a queue this floor can empty.
+                break
+            time.sleep(_WRITER_RESERVATION_POLL_SECS)
+
+
 # Durations and phases pytest_runtest_logreport has already seen for the item whose
 # runtest protocol is in flight, keyed by node id. The escape guard uses both to
 # preserve one report per phase and to charge only time no logged report covers.
@@ -1990,6 +2097,9 @@ def pytest_runtest_teardown(item, nextitem):
     """
     _join_install_receipt_workers()
     _join_test_loop_executor(item)
+    # After the loop's tasks have unwound: their ``finally`` blocks can append a member
+    # row, and that queues an event-log write.
+    _drain_fire_and_forget_writers()
     # LAST, and the order is load-bearing: everything above cancels tasks, joins executor
     # jobs and drains the crew-log writer, and the ``finally`` blocks that run as they
     # unwind APPEND -- which reaches ``note_commit``, and an enqueue after a stop starts a

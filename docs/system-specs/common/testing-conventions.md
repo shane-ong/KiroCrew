@@ -4230,6 +4230,51 @@ production really does `chdir` and really does install a record factory, and a t
 that code cannot avoid inheriting it. Restore either way — the damage is to other tests, and
 stopping it propagating is the part that is never optional.
 
+**Work QUEUED by a test is shared state too, and resetting the object it runs against is
+not enough.** MEASURED: a member row's event is fire-and-forget on the single `eventlog-io`
+worker, and the member log's path is resolved from `KIROCREW_HOME` when the append RUNS,
+not when it was queued. In three failing Windows shard-8 runs, the test just before the
+red on the same worker was a member resume that ends just after appending a row. Its
+append ran during the next test, wrote into that test's home, and raced that test's
+first `record_activity`, which returned `False`. Resetting the event-log singleton at
+the boundary does not help: the closure resolves the service AND the log path as it
+runs, so the write lands under whichever home is pinned then, and the next test's own
+first write to the same log is the thing it races. On Linux both writes land and nothing goes red, so the leak shows only where fsync
+is slow enough to widen the overlap. The rootdir `pytest_runtest_teardown` hook drains
+the single-worker writers that resolve the home when a job runs
+(`_drain_fire_and_forget_writers`: `eventlog-io` and the dashboard's `notif-io`) before
+any fixture unwinds, so the home pin and `tmp_path` still exist. It submits a no-op and
+waits on that, which a FIFO single worker answers only after everything queued before
+it, and it skips a pool whose earlier barrier never finished, so one wedged worker costs
+one slow teardown. The join budget is PER POOL: one budget shared across the table hands
+the second pool whatever the first left, which is zero exactly when the first one wedged.
+
+**A FIFO barrier alone is not a drain, because it can OVERTAKE a submission.**
+`eventlog_hooks.submit` takes its reservation under the lock, RELEASES the lock, and only
+then calls `pool.submit` — so for the length of that call the append is counted in
+`_reserved` and absent from the queue, and a barrier queued meanwhile completes ahead of
+it. Any writer that reserves before it queues therefore contributes a predicate over its
+own outstanding counts, and the drain submits the barrier again while that predicate says
+work remains. The counts are advisory (a test may replace them), so they only decide
+whether to submit AGAIN, never whether the drain happens at all — and they are read
+together under the writer's OWN lock, because the handover itself is two steps (`_reserved
++= 1`, then `_inflight.add` and `_reserved -= 1` after `pool.submit` returns), so two
+unlocked reads can land either side of it and see an empty set AND a zero count while an
+append is outstanding.
+
+`TestQueuedEventlogAppendDoesNotCrossTheTestBoundary` pins that the hook is wired into
+teardown; `test_host_isolation_floor.py::TestTheFireAndForgetWritersAreDrained` pins the
+reserve window, the wedged-pool skip, and — the ratchet — that a new module-global
+single-worker pool in `src/` is either in the table or excluded there with its reason.
+The drain is the floor's half. The fix that removes the race is the one in
+[the classes it found](#the-classes-it-found-and-the-one-correct-fix-for-each): resolve
+every path when the work is queued. These two writers do not, and the reason is where
+the resolution lives: for the member log it is spread across `crew_log/store.py`, which
+derives the home from `data_home()` at each of the log, lease, segment and checkpoint
+paths, so queue-time binding means threading a home through that module and through
+`MemberLog`. Production never moves its home, so only the suite pays. A new
+fire-and-forget writer resolves at queue time AND joins the drain.
+
 ### 5. Absolute time budgets on instrumented runs
 
 Asserting a *duration* when the property under test is algorithmic **complexity**. Coverage

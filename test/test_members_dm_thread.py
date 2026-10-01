@@ -2776,6 +2776,42 @@ class TestEventlogServiceRetirementReleasesHandles:
         assert [ev["data"].get("session") for ev in history] == ["dashboard_chat-1"]
 
 
+@pytest.mark.xdist_group(name="eventlog_queue_crosses_test_boundary")
+class TestQueuedEventlogAppendDoesNotCrossTheTestBoundary:
+    """A member append still QUEUED when a test ends must land before the next starts.
+
+    A member row's event is fire-and-forget on the single ``eventlog-io`` worker, and
+    the member log's path is resolved from ``KIROCREW_HOME`` when the append RUNS. A
+    test that ends just after appending a row (a member resume does) therefore leaves
+    an append that, undrained, runs during the next test, writes into that test's
+    home, and races its first write to the same member log. On a host with slow
+    fsync that first ``record_activity`` then returns ``False`` in
+    ``TestMemberActivityRoute``.
+
+    The pair runs in order on one worker (the group mark). The first queues an
+    append that is still in flight when it returns, as a slow host's fsync leaves
+    it; the second asserts the rootdir teardown hook drained it at the boundary.
+    """
+
+    def test_a_member_append_still_queued_when_this_test_ends(self):
+        from kiro_crew import eventlog_hooks
+
+        def _slow_member_append():
+            time.sleep(0.1)
+            record_activity(CREW, "dashboard_chat-1", "persistent", via="chat")
+
+        assert eventlog_hooks.submit(_slow_member_append)
+        assert eventlog_hooks._inflight, "the append finished before the test ended"
+
+    def test_the_next_test_starts_with_nothing_queued(self):
+        from kiro_crew import eventlog_hooks
+
+        assert not eventlog_hooks._inflight and not eventlog_hooks._reserved, (
+            "a member append queued by the previous test is still outstanding, so it "
+            "will run against THIS test's home and race its first member-log write"
+        )
+
+
 # The briefing read fails CLOSED on platforms without O_NOFOLLOW (Windows) --
 # see read_member_briefing. Tests asserting briefing CONTENT through the
 # endpoint are therefore POSIX-only; the fail-closed flag itself is what the

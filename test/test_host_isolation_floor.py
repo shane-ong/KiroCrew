@@ -36,6 +36,7 @@ import queue
 import sys
 import tempfile
 import threading
+import time
 from logging.handlers import QueueListener
 
 import pytest
@@ -2231,4 +2232,248 @@ class TestTheHooksDispatcherIsRestored:
         assert hi._lifecycle_dispatcher is sentinel, (
             "the floor restored past the dispatcher this cycle inherited, so a "
             "higher-scoped installer would be torn out after its first test"
+        )
+
+
+class TestTheFireAndForgetWritersAreDrained:
+    """The teardown drain empties a single-worker writer's queue, reservations included.
+
+    ``_drain_fire_and_forget_writers`` runs in the ``tryfirst`` teardown hook, before any
+    fixture unwinds, because the jobs on those pools resolve the data home as they RUN.
+    Behaviour half: a FIFO barrier alone can overtake a job whose caller has taken its
+    reservation and not yet reached ``pool.submit``, so the drain also consults the
+    module's outstanding counts and submits again while they say work remains.
+    """
+
+    @staticmethod
+    def _pool():
+        import concurrent.futures
+
+        return concurrent.futures.ThreadPoolExecutor(
+            max_workers=1, thread_name_prefix="floor-drain-test"
+        )
+
+    def test_a_job_reserved_but_not_yet_queued_is_still_drained(self, monkeypatch) -> None:
+        from types import SimpleNamespace
+
+        pool = self._pool()
+        landed: list[str] = []
+        # The module stands in for a writer whose caller is inside the reserve window:
+        # the first time the drain asks, the reservation is still outstanding and the
+        # job reaches the queue only then -- behind the barrier that already completed.
+        writer = SimpleNamespace(pool=pool, reserved=1)
+
+        def _still_outstanding(mod):
+            if mod.reserved:
+                mod.reserved = 0
+                mod.pool.submit(lambda: landed.append("late append"))
+                return False
+            return True
+
+        monkeypatch.setattr(
+            _root,
+            "_FIRE_AND_FORGET_POOLS",
+            (("test.floor.writer", "pool", _still_outstanding),),
+        )
+        monkeypatch.setitem(sys.modules, "test.floor.writer", writer)
+        monkeypatch.setattr(_root, "_wedged_writer_barriers", {})
+        try:
+            _root._drain_fire_and_forget_writers()
+            assert landed == ["late append"], (
+                "the drain returned while an append was reserved and not yet queued, so "
+                "it runs after the pins lift and writes into the next test's home"
+            )
+        finally:
+            pool.shutdown(wait=True)
+
+    #: A join budget this file can afford to see spent, with room for a queued job to
+    #: finish well inside it. Both tests below are about which pool gets a budget at
+    #: all, so the only timing they need is that one number is several times the other.
+    _BUDGET = 0.3
+    _SHORT_JOB = 0.05
+
+    def test_a_wedged_writer_is_skipped_rather_than_waited_out_every_time(
+        self, monkeypatch
+    ) -> None:
+        from types import SimpleNamespace
+
+        pool = self._pool()
+        release = threading.Event()
+        pool.submit(release.wait)
+        monkeypatch.setattr(_root, "_FIRE_AND_FORGET_POOLS", (("test.floor.writer", "pool", None),))
+        monkeypatch.setitem(sys.modules, "test.floor.writer", SimpleNamespace(pool=pool))
+        monkeypatch.setattr(_root, "_wedged_writer_barriers", {})
+        monkeypatch.setattr(_root, "_EXECUTOR_JOIN_SECS", self._BUDGET)
+        try:
+            _root._drain_fire_and_forget_writers()
+            assert _root._wedged_writer_barriers, "the wedged pool was not recorded"
+            started = time.monotonic()
+            _root._drain_fire_and_forget_writers()
+            assert time.monotonic() - started < self._BUDGET / 2, (
+                "the second drain waited on the wedged worker again, so every later "
+                "teardown on this worker pays the whole budget"
+            )
+        finally:
+            release.set()
+            pool.shutdown(wait=True)
+
+    def test_each_pool_gets_its_own_join_budget(self, monkeypatch) -> None:
+        """One budget shared across the table hands the second pool whatever is left.
+
+        A first pool that spends the whole join is exactly what
+        ``_wedged_writer_barriers`` exists to record, so it is not a rare case: with one
+        budget for the table the second pool is given zero and the write it had queued
+        runs after the pins lift. Asserted on the timeout each barrier is GIVEN, not on
+        whether a job finished in time -- the pools drain concurrently with the test, so
+        a real job's outcome would say nothing about the budget it was allowed.
+        """
+        import concurrent.futures
+        from types import SimpleNamespace
+
+        asked: list[float] = []
+
+        class _Barrier:
+            def __init__(self, spend):
+                self._spend = spend
+
+            def done(self):
+                return not self._spend
+
+            def result(self, timeout=None):
+                asked.append(timeout)
+                if self._spend:
+                    # A wedged worker: it burns the whole budget it was given and
+                    # still has not run the job.
+                    time.sleep(timeout)
+                    raise concurrent.futures.TimeoutError
+
+        monkeypatch.setattr(
+            _root,
+            "_FIRE_AND_FORGET_POOLS",
+            (("test.floor.slow", "pool", None), ("test.floor.fast", "pool", None)),
+        )
+        for name, spend in (("slow", True), ("fast", False)):
+            monkeypatch.setitem(
+                sys.modules,
+                f"test.floor.{name}",
+                SimpleNamespace(pool=SimpleNamespace(submit=lambda _fn, s=spend: _Barrier(s))),
+            )
+        monkeypatch.setattr(_root, "_wedged_writer_barriers", {})
+        monkeypatch.setattr(_root, "_EXECUTOR_JOIN_SECS", self._BUDGET)
+
+        _root._drain_fire_and_forget_writers()
+
+        assert len(asked) == 2, f"one barrier per pool, got {asked}"
+        assert asked[1] > self._BUDGET / 2, (
+            f"the second pool was drained on what the first left of a shared budget "
+            f"({asked[1]}s of {self._BUDGET}s), so its queued write outlives the test"
+        )
+
+    def test_the_eventlog_predicate_reads_both_counters_under_one_lock(self) -> None:
+        """Two unlocked reads can land either side of ``submit``'s own handover.
+
+        ``eventlog_hooks.submit`` bumps ``_reserved`` under the lock, releases it to call
+        ``pool.submit``, then re-acquires to move the future into ``_inflight`` and drop
+        the count. A predicate that loads the set and then the count without the lock can
+        read the set before that move and the count after it: empty and zero, while an
+        append is outstanding. The drain then stops and the append runs under the next
+        test's home.
+        """
+
+        class _Writer:
+            """A module double that records whether each read held the lock."""
+
+            def __init__(self) -> None:
+                self.depth = 0
+                self.reads: list[int] = []
+
+            @property
+            def _inflight_lock(self):
+                writer = self
+
+                class _Lock:
+                    def __enter__(self):
+                        writer.depth += 1
+                        return self
+
+                    def __exit__(self, *exc):
+                        writer.depth -= 1
+                        return False
+
+                return _Lock()
+
+            @property
+            def _inflight(self):
+                self.reads.append(self.depth)
+                return set()
+
+            @property
+            def _reserved(self):
+                self.reads.append(self.depth)
+                return 0
+
+        writer = _Writer()
+        assert _root._eventlog_hooks_quiescent(writer) is True
+        assert writer.reads == [1, 1], (
+            "the predicate read a counter outside the module's lock, so a reservation "
+            f"moving into _inflight between the two reads is missed: {writer.reads}"
+        )
+
+    def test_every_module_global_single_worker_writer_is_in_the_table(self) -> None:
+        """A NEW module-global single-worker pool must not land undrained.
+
+        Same shape as the shared-kiro-path ratchet above: deliberately wider than the
+        drain acts on, so a new writer is either drained or excluded with a reason.
+        """
+        #: Single-worker pools that need no entry. Each states why.
+        excluded = {
+            # Per-STORE, not a module global: ``TaskStore._writer_executor`` builds it
+            # on the instance and ``run`` AWAITS every job on it, so nothing of a
+            # store's is still queued when the caller returns. The store shuts it down
+            # in ``close``.
+            ("src/kiro_crew/taskq/store.py", "taskq-writer"): ("per-instance, every job awaited"),
+        }
+        drained = {module for module, _attr, _predicate in _root._FIRE_AND_FORGET_POOLS}
+        found: dict[tuple[str, str], None] = {}
+        src = pathlib.Path(__file__).resolve().parents[1] / "src"
+        for path in src.rglob("*.py"):
+            if "_vendor" in path.parts or "/tests/" in path.as_posix():
+                continue
+            text = path.read_text(encoding="utf-8")
+            if "max_workers=1" not in text:
+                continue
+            tree = ast.parse(text)
+            for node in ast.walk(tree):
+                if not isinstance(node, ast.Call):
+                    continue
+                if not any(
+                    kw.arg == "max_workers"
+                    and isinstance(kw.value, ast.Constant)
+                    and kw.value.value == 1
+                    for kw in node.keywords
+                ):
+                    continue
+                prefix = next(
+                    (
+                        kw.value.value
+                        for kw in node.keywords
+                        if kw.arg == "thread_name_prefix" and isinstance(kw.value, ast.Constant)
+                    ),
+                    "",
+                )
+                found[(path.relative_to(src.parent).as_posix(), prefix)] = None
+        module_for = {
+            "eventlog-io": "kiro_crew.eventlog_hooks",
+            "notif-io": "kiro_crew.dashboard.state",
+        }
+        unpinned = [
+            entry
+            for entry in found
+            if entry not in excluded and module_for.get(entry[1]) not in drained
+        ]
+        assert not unpinned, (
+            f"single-worker writer(s) neither drained by the floor nor excluded: {unpinned}. "
+            "A job queued on one of these resolves the data home when it RUNS, so one still "
+            "queued at teardown writes into the next test's home. Add it to "
+            "_FIRE_AND_FORGET_POOLS, or exclude it here with the reason."
         )

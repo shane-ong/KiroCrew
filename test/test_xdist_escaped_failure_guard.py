@@ -56,6 +56,20 @@ _PLUGIN = textwrap.dedent("""
     _CLOCK = 1000.0
 
 
+    # ``time`` with ``perf_counter`` frozen and everything else real. DELEGATING,
+    # not a fixed pair of attributes: the guard under test is only asked about
+    # ``perf_counter``, while any other clock the root conftest reads -- ``monotonic``,
+    # for a bounded join in its teardown hook -- has to be the real one. A namespace
+    # listing two names turns such a read into an AttributeError inside the hook.
+    class _FrozenPerfCounter:
+        def __getattr__(self, name):
+            return getattr(time, name)
+
+        @staticmethod
+        def perf_counter():
+            return _CLOCK
+
+
     def advance(seconds):
         global _CLOCK
         _CLOCK += seconds
@@ -68,10 +82,7 @@ _PLUGIN = textwrap.dedent("""
         # still run. A module-local proxy leaves stdlib time and timeout timers real.
         with pytest.MonkeyPatch.context() as patch:
             patch.setattr(timing, "perf_counter", lambda: _CLOCK)
-            patch.setattr(
-                conftest, "time",
-                SimpleNamespace(perf_counter=lambda: _CLOCK, time=time.time),
-            )
+            patch.setattr(conftest, "time", _FrozenPerfCounter())
             return (yield)
 
 
