@@ -327,6 +327,26 @@ monkeypatch.setattr("kiro_crew.dashboard.handlers._SHUTDOWN_TIMEOUT_SECS", 0.05)
 monkeypatch.setattr("kiro_crew.dashboard.handlers.sessions._SHUTDOWN_TIMEOUT_SECS", 0.05)
 ```
 
+The opposite mistake is a patch WIDER than the caller under test. A patch on a
+module global is seen by every thread in the process, so a stub with a side effect
+also fires for a background worker that calls the same function. MEASURED: a resume
+test simulated a concurrent winner as a side effect on `members.read_dm_binding`, and
+the member event log's legacy fold calls that function on its `eventlog-io` worker,
+queued by the winner's own row. When the worker reached it before the request
+returned (a loaded runner), the "winner" ran twice and the test read
+`history duplicated: 2 copies`, with two different message ids. The same test was
+green for the wrong reason: its side effect fired at the handler's FIRST binding
+read, so deleting the late re-check it was named for left it passing.
+
+So patch the function the handler awaits in the window you mean, and pin the ORDER
+of the awaits and checks the test relies on (`TestResumeGuards` records a timeline
+and asserts it exactly): a count or a call position stays green when a refactor adds
+a call or drops the one you meant. A side effect that stands in for a concurrent
+request runs on the loop: from the worker thread `asyncio.to_thread` gave the patched
+function, `asyncio.run_coroutine_threadsafe(coro, loop).result(timeout=...)`. Only
+from a worker: on the loop thread that `.result()` blocks the loop it is waiting on,
+so assert the thread first.
+
 Unit tests that exercise a caller's handling of a subprocess result stub its imported
 launch helper. For example, `cloud.aws.run_aws` tests stub `cloud.aws.popen_limited`;
 patching stdlib `Popen` underneath it still runs executable resolution and can fail
