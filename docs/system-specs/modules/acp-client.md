@@ -423,6 +423,47 @@ authored spec whose display text passes `_DISPLAY_TEXT_WARN_BYTES` and the
 directory total past `_DISPLAY_TEXT_TOTAL_WARN_BYTES`. That text still reaches
 every reply from the authored copy, so the fix for it is at its source.
 
+The strict resolver (`NativeSkillProjection.agent`, used by `session/set_mode`)
+refuses any name it never projected, so an agent cannot switch to a mode outside
+the scope it launched under. Three seams around it must not open a hole. First, an
+agent is addressable by its spec's filename STEM as well as its authored `name`,
+and the two can differ; the projection records every stem that resolves to a
+projected agent (`stems`, stem -> name) and resolves a stem to its canonical name
+before the alias/error lookup, so a stem-addressed spec is mapped or refused
+exactly as its name would be rather than passed through untranslated. Second, a
+spec that `list_agents` enumerated (its FILE exists) but `_read_agent_spec` could
+not read -- a hardlink/symlink the trusted-root gate refuses, a parse failure, an
+oversize file -- is RECORDED AS A REFUSAL (`errors`, under both name and stem),
+never silently skipped: passing its name through would let kiro-cli activate the
+on-disk spec with none of the projection's hardening. A spec file that
+`list_agents` never yields at all (the discovery layer folded its read refusal to
+`None`, so it never becomes a usable view) is backstopped THERE, at discovery, not
+re-scanned here: `spawn_agent` keeps the soft no-view pass-through for a name with
+no projected view, so an agent that simply has no skill customization spawns under
+its own authored name instead of failing to start. Third, the launched agent's OWN
+activation must not be refused because the process is already running as it even
+with no prepared view -- but this is scoped to session START, not mid-session
+switches, and the two spawn paths handle it differently. The shared runtime hosts
+MANY sessions and allows activating `self._agent` at EVERY session-start bracket
+(`_activate_mode_bracketed`), keyed on `self._agent`; it does NOT set
+`spawn_agent_name`, because that field also makes `request()` -- the general
+outbound path a mid-session `set_mode` takes -- tolerate the launch agent
+indefinitely, which would reactivate a cached unprojected spec after its view
+vanished. The direct client is one process / one session: it sets
+`spawn_agent_name`, its `request()` tolerates the launched agent's FIRST
+`set_mode` and then clears it, so a later mid-session switch back to it takes the
+strict resolver again and fails closed. The general (mid-session) `set_mode` path
+stays strict for both. The create/load availability gate uses the plain
+`_mode_available` membership test (a backend that advertises no `modes` list is no
+evidence of substitution and is admitted; an advertised list that omits the agent
+fails closed), and `_verify_spawn_agent_active` (Guard A/A2) remains the
+substitution check. Because the direct-client start reads the session reply's
+`availableModes` BEFORE it sends `set_mode`, `frame` keeps the launched agent's
+own mode in projected `availableModes` while `spawn_agent_name` is set -- otherwise
+it would advertise no mode the process could activate and fail the start during
+initialization; once the direct client has consumed it the mode is hidden again
+like any unprojected agent.
+
 Projected agent JSON contains only fields accepted by Kiro's strict
 schema; lifecycle ownership lives in the non-spec
 `.kirocrew-skill-projection-metadata` directory. Each sidecar records the alias's

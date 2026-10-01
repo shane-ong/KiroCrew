@@ -7804,12 +7804,19 @@ class AcpClient:
             self._native_skill_projection = await asyncio.to_thread(
                 prepare_native_skill_projection, self._work_dir, per_session_element=False
             )
+            if self._native_skill_projection is not None:
+                # The agent this process is launched as: its own FIRST ``set_mode``
+                # activation is tolerated even with no prepared view (see
+                # NativeSkillProjection.request), which consumes the exemption --
+                # so a later switch, including back to this same agent once its
+                # view has vanished, takes the strict resolver and fails closed.
+                self._native_skill_projection.spawn_agent_name = self._agent
             argv = [
                 kiro_bin,
                 KIRO_CLI_SUBCMD,
                 "--agent",
                 (
-                    self._native_skill_projection.agent(self._agent)
+                    self._native_skill_projection.spawn_agent(self._agent)
                     if self._native_skill_projection is not None
                     else self._agent
                 ),
@@ -9386,7 +9393,23 @@ class AcpClient:
         #    escalation. Self-heal (B, in _spawn) regenerates the managed default
         #    so the common case never reaches this branch.
         if self._is_kiro:
-            if not self._modes_advertised or self._agent in self._available_mode_ids:
+            # The advertised ids were rewritten to each agent's DECLARED name by
+            # the projection's reverse map (frame()), so a process launched under
+            # a filename STEM that differs from its spec's declared name would
+            # find its stem absent here and fail closed on an otherwise valid
+            # start. Compare the DECLARED name the projection publishes --
+            # resolving the stem through the SAME projection already on this
+            # client (no new start-path state) -- while still sending the launch
+            # identity as the modeId, which request() tolerates for the agent's
+            # own first activation. A stem with no projected view, or any
+            # non-kiro path, resolves to itself and the guard is unchanged.
+            projection = getattr(self, "_native_skill_projection", None)
+            advertised_name = (
+                projection.launch_identity_name(self._agent)
+                if projection is not None
+                else self._agent
+            )
+            if not self._modes_advertised or advertised_name in self._available_mode_ids:
                 await self._send_request(
                     METHOD_SET_MODE,
                     {"sessionId": self._session_id, "modeId": self._agent},

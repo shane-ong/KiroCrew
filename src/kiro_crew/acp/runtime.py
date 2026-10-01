@@ -1938,11 +1938,25 @@ class AcpRuntime:
                 # (_activate_mode_bracketed), and holding the object keeps its
                 # lease -- and them -- out of the prune.
                 self._spawn_skill_projection = self._native_skill_projection
+                self._record_agents_in_projection(self._native_skill_projection)
                 if self._native_skill_projection is not None:
+                    # Deliberately do NOT set spawn_agent_name here. The shared
+                    # runtime activates the launched agent through
+                    # _activate_mode_bracketed, which allows self._agent at every
+                    # session start explicitly (keyed on self._agent, translate
+                    # bypassing request()). Setting spawn_agent_name would ALSO make
+                    # request() -- the general outbound path a mid-session set_mode
+                    # takes -- tolerate the launch agent indefinitely, so a switch
+                    # back to it after its view vanished would reactivate a cached
+                    # unprojected spec the strict resolver exists to refuse. The
+                    # field stays empty on the shared runtime; only the direct
+                    # client (one session, no mid-session re-entry) sets it.
                     argv = list(argv)
                     agent_position = argv.index("--agent") + 1
                     try:
-                        argv[agent_position] = self._native_skill_projection.agent(self._agent)
+                        argv[agent_position] = self._native_skill_projection.spawn_agent(
+                            self._agent
+                        )
                     except ValueError as exc:
                         # The projection refused this agent's view -- a
                         # ``kirocrew-core`` restriction authored in its spec, a
@@ -1952,7 +1966,13 @@ class AcpRuntime:
                         # paths translate (``providers/acp.py`` handles
                         # ``AcpRuntimeError`` around ``spawn()``); a bare
                         # ``ValueError`` would leave ``spawn()`` as an internal
-                        # failure with the actionable text unread.
+                        # failure with the actionable text unread. ``spawn_agent``
+                        # raises for that authored refusal AND for a spec present
+                        # on disk that the reader refused -- an unreadable or
+                        # unparseable file, a hardlink or non-regular inode the
+                        # trusted-root gate rejects -- recorded under its name and
+                        # stem in ``errors``. An agent with a genuinely absent
+                        # spec keeps its authored name and never lands here.
                         raise AcpRuntimeError(str(exc)) from exc
         except _KiroExecutableTrustError as exc:
             raise AcpRuntimeError(str(exc)) from exc
@@ -4987,6 +5007,72 @@ class AcpRuntime:
     def _unadopted_skill_projection_generation(self) -> int:
         return int(getattr(self, "_skill_projection_unadopted", 0))
 
+    def _record_agents_in_projection(self, projection: Any) -> None:
+        """Remember every agent *projection* HAD a view for or REFUSED.
+
+        The launch-name pass-through (``_resolve_start_alias``) is safe only for an
+        agent NO adopted projection has ever held -- a genuine never-viewed agent.
+        The launch snapshot alone cannot answer that: a spec authored mid-life and
+        adopted, then deleted, leaves the launch snapshot still saying "no view" so
+        the next start would pass the authored name through and reactivate the
+        cached deleted spec. Accumulating the agents of EVERY adopted projection
+        here -- its ``aliases`` keys (it mapped a view), its ``errors`` keys (it
+        refused one), and its ``stems`` keys (a filename stem the backend resolves
+        to that same agent, the identity a stem-launched agent lives under) -- lets
+        that check consult the whole life of the runtime, not one frozen instant.
+
+        The names come from an agent-writable directory, so this set is BOUNDED
+        like the sibling stores for the same population (``_recognised``,
+        ``_VIEW_SOURCES``): only ``_admissible_source_agent``-shaped names are
+        admitted (the registered agent-name grammar bounds each name's length and
+        admits no control character -- an ``errors`` or ``stems`` key may be a raw
+        filename stem, so this also rejects a hostile stem), and the set stops
+        growing at ``_RECOGNISED_ALIASES_MAX``, logging the overflow once. The
+        launch identity ``self._agent`` is retained BEFORE the cap and never
+        counts against it: it is one bounded name, and it is the one identity the
+        pass-through gate's correctness depends on, so a projection that overflows
+        the cap must not be able to drop the launched agent back to "never
+        projected". Past the cap another churned-and-deleted spec drops out of the
+        set, which only loosens the pass-through back toward the launch-snapshot
+        answer -- it never reactivates a spec the strict resolver would refuse,
+        because that resolver still runs for every mode_agent that is not the
+        launch agent."""
+        if projection is None:
+            return
+        from kiro_crew.acp.skill_projection import (
+            _RECOGNISED_ALIASES_MAX,
+            _admissible_source_agent,
+        )
+
+        seen: set[str] = getattr(self, "_agents_ever_projected", None) or set()
+        dropped = 0
+        for name in (
+            *(getattr(projection, "aliases", {}) or {}),
+            *(getattr(projection, "errors", {}) or {}),
+            *(getattr(projection, "stems", {}) or {}),
+        ):
+            if name in seen:
+                continue
+            if not _admissible_source_agent(name):
+                continue
+            # The launch identity is retained before the cap: it is the one name
+            # the pass-through gate must never lose to overflow. Every other name
+            # stops at the bound.
+            if name != self._agent and len(seen) >= _RECOGNISED_ALIASES_MAX:
+                dropped += 1
+                continue
+            seen.add(name)
+        self._agents_ever_projected = seen
+        if dropped and not getattr(self, "_agents_ever_projected_overflow_warned", False):
+            self._agents_ever_projected_overflow_warned = True
+            logger.warning(
+                "skill projection: %d agent name(s) not retained in the ever-projected set "
+                "past the %d-name bound; a spec that churned past the cap and was then "
+                "deleted may spawn under its authored name until the gateway restarts",
+                dropped,
+                _RECOGNISED_ALIASES_MAX,
+            )
+
     def _adopt_skill_projection(self, prepared: Any, generation: int) -> bool:
         """Make *prepared* this runtime's projection unless a newer one was adopted.
 
@@ -4996,6 +5082,7 @@ class AcpRuntime:
             return False
         self._native_skill_projection = prepared
         self._skill_projection_generation = generation
+        self._record_agents_in_projection(prepared)
         return True
 
     async def _write_response_bounded(self, data: bytes, request_id: str | int) -> None:
@@ -5595,6 +5682,53 @@ class AcpRuntime:
             f"--agent-only` to rewrite the agent config."
         )
 
+    def _resolve_start_alias(self, projection: Any, mode_agent: str) -> str:
+        """Resolve *mode_agent*'s alias for a session START, launch-agent-aware.
+
+        The launched agent's own activation is allowed at EVERY start even with
+        no prepared view (the process is already running as it, and a shared
+        runtime starts many sessions as self._agent over its life), so it takes
+        ``spawn_agent`` (which keeps the authored name) rather than the strict
+        ``agent``. Every OTHER mode_agent takes the strict resolver, so a switch
+        to a mode this view never prepared is still rejected. Used at the initial
+        resolution AND at both supersession re-checks, so a newer EMPTY projection
+        adopted by a concurrent start does not reject the unchanged launch agent
+        the strict resolver has no entry for.
+
+        The pass-through is permitted ONLY when NO adopted projection in this
+        runtime's life has ever held a view for this agent or recorded a refusal
+        for it (``_spawn_projection_lacked_view``, which reads the cumulative
+        ``_agents_ever_projected`` set, not the launch snapshot alone) -- a genuine
+        never-viewed agent kiro-cli runs under its authored name. If the agent HAD
+        a view at some adopted projection but the current one lacks one (its spec
+        was deleted or renamed while the runtime stayed warm), pass-through would
+        reactivate the cached pre-deletion spec and its grants, so it takes the
+        strict ``agent`` and fails closed instead."""
+        if (
+            mode_agent
+            and mode_agent == self._agent
+            and self._spawn_projection_lacked_view(mode_agent)
+        ):
+            return str(projection.spawn_agent(mode_agent))
+        return str(projection.agent(mode_agent))
+
+    def _spawn_projection_lacked_view(self, mode_agent: str) -> bool:
+        """Whether NO adopted projection has ever held a view for *mode_agent*.
+
+        The launch-name pass-through (``_resolve_start_alias``) is safe only for an
+        agent that spawned under its own authored name and that NO projection in
+        this runtime's life has ever mapped to a view or recorded a refusal for --
+        a genuine never-viewed agent. Consulting the launch snapshot alone is not
+        enough: a spec authored mid-life and adopted, then deleted, leaves that
+        snapshot still saying "no view", so the next start would pass the name
+        through and reactivate the cached deleted spec. ``_agents_ever_projected``
+        accumulates every agent any adopted projection HAD a view for or REFUSED
+        (see :meth:`_record_agents_in_projection`), so an agent that was ever
+        projected -- even transiently -- takes the strict resolver and fails closed
+        once its view is gone, instead of reactivating a stale cached spec."""
+        ever = getattr(self, "_agents_ever_projected", None) or set()
+        return mode_agent not in ever
+
     def _superseding_alias(self, projection: Any, mode_agent: str) -> str:
         """*mode_agent*'s alias in a newer view adopted while its start was pending.
 
@@ -5602,7 +5736,7 @@ class AcpRuntime:
         sent again; when the newer view does not offer the agent at all, the
         start fails rather than fall back to the older one."""
         try:
-            return str(projection.agent(mode_agent))
+            return self._resolve_start_alias(projection, mode_agent)
         except ValueError as exc:
             emit_counter(SKILL_VIEW_FALLBACKS, {"outcome": "refused_superseded"})
             raise AcpRuntimeError(
@@ -5655,7 +5789,11 @@ class AcpRuntime:
             return
         projection = getattr(self, "_native_skill_projection", None)
         try:
-            newest = projection.agent(mode_agent) if projection is not None else None
+            newest = (
+                self._resolve_start_alias(projection, mode_agent)
+                if projection is not None
+                else None
+            )
         except ValueError:
             newest = None
         if newest == sent_alias:
@@ -5832,7 +5970,21 @@ class AcpRuntime:
             sent_alias: str | None = None
             untranslated: dict[str, Any] = {}
             if projection_now is not None:
-                sent_alias = projection_now.agent(mode_agent)
+                # The launched agent's own activation is allowed at EVERY session
+                # start, even with no prepared view: the process is already running
+                # as it, and a shared runtime starts many sessions as self._agent
+                # over its life, so this is not a one-shot token to consume -- doing
+                # so would break the second shared session that legitimately starts
+                # as the same agent. _resolve_start_alias keeps the authored name
+                # for self._agent; every OTHER mode_agent takes the strict agent(),
+                # so a switch to a mode this projection never prepared is still
+                # rejected and an agent cannot escape its scope. The SAME resolver
+                # runs at both supersession re-checks below, so a newer empty
+                # projection adopted by a concurrent start does not reject the
+                # unchanged launch agent. The general (mid-session) set_mode path
+                # stays strict as before -- this allowance is scoped to the start
+                # bracket and keyed on self._agent, not on a mutable token.
+                sent_alias = self._resolve_start_alias(projection_now, mode_agent)
                 wire = {**params, "modeId": sent_alias}
                 untranslated = {"translate": False}
             retries = iter(_PROJECTED_MODE_RETRY_DELAYS_SECS)

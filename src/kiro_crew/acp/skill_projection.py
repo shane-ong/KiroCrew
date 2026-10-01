@@ -31,8 +31,13 @@ from typing import Any
 
 from kiro_crew import pinned_fs, platform_compat
 from kiro_crew.acp import session_mcp
-from kiro_crew.agent_discovery import SCOPE_PROJECT, _read_agent_spec, list_agents
-from kiro_crew.agent_spec_format import NATIVE_SKILL_ALIAS_PREFIX
+from kiro_crew.agent_discovery import (
+    SCOPE_PROJECT,
+    _project_scope_denied,
+    _read_agent_spec,
+    list_agents,
+)
+from kiro_crew.agent_spec_format import NATIVE_SKILL_ALIAS_PREFIX, iter_agent_spec_files
 from kiro_crew.atomic_write import atomic_write, on_event_loop
 from kiro_crew.config.paths import data_home, kiro_agents_dir, kiro_home, project_agents_dir
 from kiro_crew.hooks import FileTooLargeError, safe_read_file_bytes
@@ -459,6 +464,31 @@ class NativeSkillProjection:
     specs: dict[str, dict[str, Any]] = field(default_factory=dict)
     errors: dict[str, str] = field(default_factory=dict)
     search_agents: set[str] = field(default_factory=set)
+    #: Every filename STEM the backend can resolve to a projected agent, mapped to
+    #: that agent's canonical name. kiro-cli addresses an agent by its spec's
+    #: filename stem as well as its authored ``name``, and the two can differ, so
+    #: a stem is a second backend-resolvable identity for the same spec. Recording
+    #: it lets :meth:`agent` map or refuse a stem exactly as it would the name --
+    #: otherwise a mode/spawn addressing the stem would slip past the alias and
+    #: error maps (both keyed on the name) and reach the cached spec untranslated,
+    #: which is the refusal the projection exists to enforce being bypassed.
+    stems: dict[str, str] = field(default_factory=dict)
+    #: The agent a DIRECT CLIENT (one process / one session) was launched as,
+    #: recorded by that spawn caller after preparation. The process is already
+    #: running as it, so its first ``session/set_mode`` activation must be
+    #: tolerated even with no prepared view -- refusing it would strand a valid
+    #: startup. ``request()`` tolerates that FIRST activation and then clears this,
+    #: so a later mid-session switch back to the launch agent takes the strict
+    #: resolver and fails closed if its view has vanished. ``frame`` keeps the
+    #: launched agent's mode in projected ``availableModes`` while this is set, so
+    #: the start -- which reads ``availableModes`` before sending ``set_mode`` --
+    #: finds an activatable mode. The SHARED RUNTIME does NOT set this: it activates
+    #: the launched agent through ``_activate_mode_bracketed``, which allows
+    #: ``self._agent`` at every session start explicitly, and setting this would
+    #: make ``request()`` tolerate the launch agent on a mid-session switch too,
+    #: reactivating a cached unprojected spec. Every OTHER modeId is strict. Empty
+    #: until set, which keeps the strict answer for a projection no spawn claimed.
+    spawn_agent_name: str = ""
     _lease_finalizer: Any = field(default=None, repr=False, compare=False)
     # Aliases an EARLIER projection of this process published, alias -> agent. The
     # host may still hold them (every alias it loaded at spawn, say), so inbound
@@ -474,7 +504,17 @@ class NativeSkillProjection:
         is guaranteed to hold -- are the last to be refused once the bound is met.
         Only alias-shaped names mapped to admissible agent names are kept, so the
         count bound bounds the memory too.
+
+        The launch-name exemption is projection state too, so it rides this same
+        seam: a fresh projection starts with an empty ``spawn_agent_name``, and a
+        refresh that inherits an earlier projection's aliases must also inherit the
+        one name whose own ``session/set_mode`` activation stays tolerated with no
+        prepared view (see :meth:`request`). Carrying it HERE keeps every refresh
+        site correct rather than each having to remember to copy it, and only fills
+        an empty value so a projection that already knows its launch name keeps it.
         """
+        if earlier.spawn_agent_name and not self.spawn_agent_name:
+            self.spawn_agent_name = earlier.spawn_agent_name
         dropped = 0
         for alias, name in (
             *((a, n) for n, a in earlier.aliases.items()),
@@ -510,15 +550,82 @@ class NativeSkillProjection:
             if source is None:
                 raise RetiredSkillView(name)
             name = source
+        # A spec is addressable by its filename stem as well as its authored name,
+        # and the two can differ. Resolve a stem to the canonical name FIRST, so a
+        # stem-addressed spec is mapped to its alias or refused by its error entry
+        # exactly as its name would be -- never passed through untranslated, which
+        # would bypass the projection's refusal for that spec.
+        if name not in self.aliases and name not in self.errors and name in self.stems:
+            name = self.stems[name]
         if name not in self.aliases:
             if name in self.errors:
                 raise ValueError(f"Agent {name!r}: {self.errors[name]}")
             raise ValueError(f"Agent {name!r} has no prepared skill discovery view")
         return self.aliases[name]
 
+    def launch_identity_name(self, name: str) -> str:
+        """Return the DECLARED name a launch identity is advertised under.
+
+        A process is launched under its ``--agent`` identity, which may be a
+        filename STEM that differs from the spec's declared ``name`` (the only
+        case ``stems`` is populated). :meth:`frame` rewrites the host's
+        advertised mode ids to each agent's declared name, so the direct
+        client's start-mode membership test must compare that declared name,
+        not the raw stem. Resolve a stem to its declared name here; a declared
+        name, or a stem with no projected view, resolves to itself so the test
+        is unchanged for every ordinary launch. Unlike :meth:`agent` this never
+        raises and never returns an alias -- it answers "what name does the
+        host advertise this launch identity under", for a membership check only.
+        """
+        if name not in self.aliases and name not in self.errors and name in self.stems:
+            return self.stems[name]
+        return name
+
+    def spawn_agent(self, name: str) -> str:
+        """Resolve the ``--agent`` transport name for a spawn, tolerating no view.
+
+        The strict :meth:`agent` guards ``session/set_mode``: a mid-session
+        switch to a mode this projection never prepared must be rejected, so an
+        agent cannot escape the scope it was launched under. Spawn selection asks
+        a softer question. An agent whose spec an authored restriction refused --
+        a ``kirocrew-core`` exclusion, a disabled ``skill_search`` -- is a
+        user-facing spawn refusal that still raises (the callers wrap it as
+        ``AcpRuntimeError`` and the startup paths translate the sentence). An
+        agent that simply has no prepared view -- its spec is not among the
+        projected agents, as in a work_dir that carries no such spec -- keeps its
+        authored transport name, the same answer a ``None`` projection gives: the
+        agent spawns under its own name rather than aborting an otherwise valid
+        spawn over a skill view it never asked for.
+        """
+        if (
+            is_skill_view_name(name)
+            or name in self.aliases
+            or name in self.errors
+            or name in self.stems
+        ):
+            return self.agent(name)
+        return name
+
     def request(self, method: str, params: dict[str, Any]) -> dict[str, Any]:
         if method == "session/set_mode":
-            return {**params, "modeId": self.agent(str(params.get("modeId", "")))}
+            mode_id = str(params.get("modeId", ""))
+            # The launched agent's own activation is tolerated even with no
+            # prepared view: the process is already running as it, so the initial
+            # ``set_mode`` that activates it must not be refused. ``spawn_agent``
+            # gives that name back unchanged; every other modeId takes the strict
+            # ``agent``, so a mid-session switch to a mode this projection never
+            # prepared is still rejected and an agent cannot escape its scope.
+            tolerated = bool(mode_id) and mode_id == self.spawn_agent_name
+            resolve = self.spawn_agent if tolerated else self.agent
+            translated = {**params, "modeId": resolve(mode_id)}
+            if tolerated:
+                # CONSUME the exemption once spent: it covers only the launched
+                # agent's FIRST activation. Cleared, a later set_mode back to the
+                # same agent takes the strict ``agent`` again -- so a view that has
+                # since vanished fails closed instead of reactivating a cached spec
+                # the strict resolver existed to refuse.
+                self.spawn_agent_name = ""
+            return translated
         if method == "_kiro.dev/commands/execute":
             command = params.get("command", "")
             if isinstance(command, dict):
@@ -557,6 +664,16 @@ class NativeSkillProjection:
                         mode_id = item.get("id")
                         name = reverse.get(mode_id) if isinstance(mode_id, str) else None
                         if name is None and mode_id in self.aliases:
+                            name = mode_id
+                        # The launched agent's own mode stays listed while its
+                        # exemption is unconsumed, even with no prepared view: the
+                        # initial set_mode request() tolerates it (keyed on the same
+                        # spawn_agent_name), so dropping it from availableModes would
+                        # advertise no mode the process could activate and fail the
+                        # direct-client start during initialization. Once the
+                        # exemption is consumed spawn_agent_name is "", so this
+                        # stops matching and an unprojected agent is hidden again.
+                        if name is None and bool(mode_id) and mode_id == self.spawn_agent_name:
                             name = mode_id
                         if name is None or name in listed:
                             continue
@@ -2525,6 +2642,7 @@ def prepare_native_skill_projection(
     errors: dict[str, str] = {}
     search_agents: set[str] = set()
     display_sizes: dict[str, tuple[int, str]] = {}
+    stems: dict[str, str] = {}
     for agent in list_agents(project_dir=str(work_dir)):
         if not agent.filename:
             continue
@@ -2532,9 +2650,33 @@ def prepare_native_skill_projection(
             project_agents_dir(str(work_dir)) if agent.scope == SCOPE_PROJECT else directory
         )
         source = source_dir / agent.filename
+        stem = Path(agent.filename).stem
         spec = _read_agent_spec(source, operation="native_skill_projection", source="acp")
         if spec is None:
+            # The spec FILE exists -- list_agents enumerated it -- but could not be
+            # read (a hardlink/symlink the trusted-root gate refuses, a parse
+            # failure, a size cap). Refusing it is mandatory: passing its name
+            # through would let kiro-cli activate the on-disk spec with NONE of the
+            # projection's hardening, the exact bypass the strict resolver exists
+            # to close. Record the refusal under BOTH the name and the stem so
+            # neither identity reaches the pass-through, and keep going so one
+            # unreadable spec never aborts preparation of the healthy ones.
+            errors[agent.name] = (
+                "its spec could not be read (unreadable, unparseable, or oversized), "
+                "so no verified skill view could be prepared"
+            )
+            if stem and stem != agent.name:
+                stems[stem] = agent.name
             continue
+        # Register the stem the MOMENT the spec is readable, before any validation
+        # continue below. A spec's filename stem is a second identity the backend
+        # resolves to this same agent; recording it here (unless it already IS the
+        # name) means agent() maps or refuses a stem-addressed spec exactly as its
+        # name -- including a spec that a validation branch below refuses into
+        # ``errors`` and skips, which must stay refused when reached by its stem,
+        # not pass through untranslated.
+        if stem and stem != agent.name:
+            stems[stem] = agent.name
         display_sizes[agent.name] = (_display_text_bytes(spec), source.absolute().as_posix())
         view = copy.deepcopy(spec)
         _strip_alias_display_text(view)
@@ -2637,6 +2779,93 @@ def prepare_native_skill_projection(
                 view["prompt"] = "file://" + (source.parent / path).absolute().as_posix()
         specs[agent.name] = view
         sources[agent.name] = source.absolute().as_posix()
+
+    # list_agents() enumerates every candidate but does not surface every one as a
+    # projected identity. Two drops leave a backend-resolvable stem with no entry
+    # in aliases, errors or stems, so spawn_agent() would hand that stem straight
+    # back and let kiro-cli load the raw on-disk spec with none of this
+    # projection's hardening:
+    #
+    #   1. A spec the reader REFUSES -- a hardlink or non-regular inode the
+    #      trusted-root gate rejects, a fenced/sensitive target, an oversized or
+    #      unparseable file -- never reaches the build loop above, so it is in no
+    #      map. Fail closed under its stem.
+    #   2. A READABLE dedup-loser twin: a locally published package writes both
+    #      ``{package}-{name}.json`` and ``local-{package}-{name}.json`` for one
+    #      agent, and list_agents keeps one row and drops the other. The dropped
+    #      twin reads fine but its own filename stem is in no map, yet the backend
+    #      resolves ``--agent <that stem>`` to the same on-disk spec. Map that stem
+    #      to the surviving agent's canonical name when that name is projected (so
+    #      it resolves to the same hardened view), else refuse it.
+    #
+    # Re-walk the SAME scope-decided directories list_agents read, through the SAME
+    # guarded reader. Scoped to ``.json`` candidates on purpose: a ``.json`` file
+    # is unambiguously spec-shaped, so a reader refusal is a genuine dropped spec
+    # and a readable one declares a resolvable name. A ``.md`` entry is not -- a
+    # plain fenceless markdown document is a legitimate non-spec the reader also
+    # returns ``None`` for, so refusing every unreadable ``.md`` would fail closed
+    # on an ordinary note (the over-blocking that turns a valid no-view spawn into
+    # "cannot start"); a fenced ``.md`` spec at a refused inode cannot be
+    # fence-checked without reading the very inode the gate refuses, so it is left
+    # to the discovery backstop (the backend cannot read that inode either).
+    scan_dirs: list[Path] = [directory]
+    try:
+        if _project_scope_denied(str(work_dir), operation="native_skill_projection", source="acp"):
+            project_scope = None
+        else:
+            project_scope = project_agents_dir(str(work_dir))
+    except OSError:
+        project_scope = None
+    if project_scope is not None:
+        scan_dirs.append(project_scope)
+    for scan_dir in scan_dirs:
+        try:
+            if not scan_dir.is_dir():
+                continue
+            candidates = iter_agent_spec_files(scan_dir)
+        except OSError:
+            # A directory the walk itself cannot read contributes no candidates;
+            # a spec hidden behind an unreadable directory is unreachable by the
+            # backend too, so there is nothing to refuse.
+            continue
+        for candidate in candidates:
+            if candidate.suffix.lower() != ".json":
+                continue
+            candidate_stem = candidate.stem
+            if candidate_stem in aliases or candidate_stem in errors or candidate_stem in stems:
+                continue
+            candidate_spec = _read_agent_spec(
+                candidate, operation="native_skill_projection", source="acp"
+            )
+            if candidate_spec is None:
+                # Unreadable/unparseable/refused: fail closed under its stem so
+                # spawn_agent()/agent() reject it instead of passing the stem
+                # through to an unprojected backend load.
+                errors[candidate_stem] = (
+                    "its spec could not be read (unreadable, unparseable, or oversized), "
+                    "so no verified skill view could be prepared"
+                )
+                continue
+            # Readable candidate list_agents dropped. The hazard GPT named is a
+            # dedup-loser twin: a locally published package writes
+            # ``{package}-{name}.json`` and ``local-{package}-{name}.json`` for ONE
+            # agent, list_agents keeps one row and drops the other, and the dropped
+            # twin's own stem then resolves ``--agent`` to the same spec with none
+            # of the projected view's hardening. When this candidate's declared name
+            # is one this preparation PROJECTED (a view in ``specs``) or REFUSED (an
+            # ``errors`` entry), it is exactly that twin: map its stem to that name
+            # so a spawn/activation addressing the stem lands on the same hardened
+            # view, or the same authored refusal. (``aliases`` is not consulted
+            # here: the alias strings are assigned later under the alias lock, so at
+            # this point ``specs`` is the record of what was projected.) A readable
+            # candidate whose declared name is neither projected nor refused is not
+            # that hazard -- it is an ordinary agent with no prepared view, which
+            # spawns identically under its name or its stem (there is no view to
+            # bypass) -- so it keeps the soft pass-through rather than being
+            # over-blocked.
+            declared = candidate_spec.get("name")
+            if isinstance(declared, str) and (declared in specs or declared in errors):
+                stems[candidate_stem] = declared
 
     _warn_on_display_text(display_sizes)
     try:
@@ -2759,7 +2988,13 @@ def prepare_native_skill_projection(
                     local[_INHERIT_SOURCE] = preference_source
                     local[_INHERIT_SETTING] = True
                     atomic_write(locked_settings, json.dumps(local, indent=2))
-                    prepared = NativeSkillProjection(aliases, specs, errors, search_agents)
+                    prepared = NativeSkillProjection(
+                        aliases,
+                        specs,
+                        errors,
+                        search_agents,
+                        stems,
+                    )
                     _remember_view_sources(aliases)
                     prepared._lease_finalizer = weakref.finalize(prepared, lease_stack.close)
                 except BaseException:
