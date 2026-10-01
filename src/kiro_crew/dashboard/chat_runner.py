@@ -131,6 +131,8 @@ from kiro_crew.dashboard.chat_utils import (
     _BLOCKED_SLASH_COMMANDS,
     _KIRO_ONLY_BLOCKED_SLASH_COMMANDS,
     _MAX_TOOL_PURPOSE,
+    STEER_POSSIBLY_DELIVERED_META,
+    STEER_POSSIBLY_DELIVERED_NOTE,
     ResetCause,
     _append_compaction_notice,
     _apply_incognito_prefix,
@@ -8327,6 +8329,7 @@ def _settle_consumed_steers(
     for settled_msg in set(previous) - set(remaining):
         slot._steer_attachment_meta.pop(settled_msg, None)
         slot._steer_decision_strips.pop(settled_msg, None)
+        slot._steer_possibly_delivered.discard(settled_msg)
 
 
 def _requeue_unconsumed_steers(state: "DashboardState", slot: "_ChatSlot") -> None:
@@ -8443,6 +8446,10 @@ def _requeue_unconsumed_steers(state: "DashboardState", slot: "_ChatSlot") -> No
         # narrower channel authority a queued channel message carries. Absent means
         # not through a channel.
         _channel = bool(getattr(slot, "_steer_channel_origin", {}).pop(steer_msg, False))
+        _maybe_delivered: set[str] = getattr(slot, "_steer_possibly_delivered", set())
+        if steer_msg in _maybe_delivered:
+            _maybe_delivered.discard(steer_msg)
+            _meta[STEER_POSSIBLY_DELIVERED_META] = True
         qid = slot.queue_insert(
             0,
             steer_msg,
@@ -9533,6 +9540,8 @@ async def _start_next_queued_turn(
             _drained_meta.update(
                 (k, v) for k, v in _item_meta.items() if k != QUEUED_CONTAINMENT_META_KEY
             )
+    # Model input only: the row keeps the user's text as typed.
+    _possibly_delivered_steer = bool(_drained_meta.pop(STEER_POSSIBLY_DELIVERED_META, False))
     if _drained_ids:
         _drained_meta.pop("steer_delivery_id", None)
         _drained_meta["steer_delivery_ids"] = _drained_ids
@@ -9701,7 +9710,12 @@ async def _start_next_queued_turn(
     task = spawn_guarded_turn(
         state,
         slot,
-        _run_chat(state, slot, next_msg, **_run_kwargs),
+        _run_chat(
+            state,
+            slot,
+            (STEER_POSSIBLY_DELIVERED_NOTE + next_msg if _possibly_delivered_steer else next_msg),
+            **_run_kwargs,
+        ),
     )
     slot.task = task
     if _stage_delivery_entry is not None:
@@ -19510,6 +19524,10 @@ async def _run_chat(
                 _turn_emitted,
                 cause=ResetCause.CONNECTION_LOST,
                 message_is_synthetic=_is_synthetic,
+                # A request-frame drain stall may have delivered the buffered
+                # prompt to a kiro-cli that resumed reading; replaying it verbatim
+                # would run its tools twice. Resume from restored state instead.
+                ambiguous_delivery=getattr(exc, "ambiguous_delivery", False),
             )
             _queue_recovery(
                 0,
