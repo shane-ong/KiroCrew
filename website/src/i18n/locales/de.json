@@ -13120,6 +13120,8 @@
         "save": "Speichern",
         "saved": "Gespeichert",
         "saving": "Wird gespeichert…",
+        "session_memory_limit": "Speicherlimit für inaktive Sitzungen",
+        "session_memory_limit_hint": "Startet eine inaktive Sitzung neu, wenn ihre Prozesse mehr Speicher belegen. Eine Sitzung, die im Hintergrund noch arbeitet, bleibt erhalten. 0 schaltet dies aus.",
         "session_timeout": "Sitzungs-Timeout",
         "subagent_settings": "Subagenten-Einstellungen",
         "takes_effect_on_next_session_range_60_86400s": "Wird in der nächsten Sitzung wirksam. Bereich: 60–86400 s.",

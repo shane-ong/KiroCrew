@@ -13308,6 +13308,8 @@
         "save": "Enregistrer",
         "saved": "Enregistré",
         "saving": "Enregistrement…",
+        "session_memory_limit": "Limite mémoire des sessions inactives",
+        "session_memory_limit_hint": "Redémarre une session inactive lorsque ses processus utilisent plus de mémoire que cette valeur. Une session qui travaille encore en arrière-plan est conservée. 0 désactive cette option.",
         "session_timeout": "Délai d'expiration de session",
         "subagent_settings": "Paramètres des sous-agents",
         "takes_effect_on_next_session_range_60_86400s": "Prend effet à la prochaine session. Plage : 60–86400s.",

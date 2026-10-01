@@ -12932,6 +12932,8 @@
         "save": "저장",
         "saved": "저장됨",
         "saving": "저장 중…",
+        "session_memory_limit": "유휴 세션 메모리 한도",
+        "session_memory_limit_hint": "유휴 세션의 프로세스가 이 값보다 많은 메모리를 사용하면 세션을 다시 시작합니다. 백그라운드에서 아직 작업 중인 세션은 유지됩니다. 0이면 사용하지 않습니다.",
         "session_timeout": "세션 타임아웃",
         "subagent_settings": "서브에이전트 설정",
         "takes_effect_on_next_session_range_60_86400s": "다음 세션부터 적용됩니다. 범위: 60–86400초.",

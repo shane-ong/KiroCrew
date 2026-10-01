@@ -539,6 +539,7 @@ class TestPendingInjectionIsSpared:
             patch.object(session_mod.platform_compat, "IS_WINDOWS", False),
             patch("kiro_crew.session._build_child_map", return_value={}),
             patch("kiro_crew.session._rss_mb_from_tree", return_value=2048),
+            patch("kiro_crew.session._cpu_ns_from_tree", return_value=None),
         ):
             await mgr._rss_threshold_check()
 
@@ -569,6 +570,7 @@ class TestPendingInjectionIsSpared:
             patch.object(session_mod.platform_compat, "IS_WINDOWS", False),
             patch("kiro_crew.session._build_child_map", return_value={}),
             patch("kiro_crew.session._rss_mb_from_tree", return_value=2048),
+            patch("kiro_crew.session._cpu_ns_from_tree", return_value=None),
         ):
             await mgr._rss_threshold_check()
 

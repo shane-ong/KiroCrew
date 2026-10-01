@@ -12932,6 +12932,8 @@
         "save": "保存",
         "saved": "保存済み",
         "saving": "保存中…",
+        "session_memory_limit": "アイドルセッションのメモリ上限",
+        "session_memory_limit_hint": "アイドル状態のセッションのプロセスがこの値を超えるメモリを使うと、そのセッションを再起動します。バックグラウンドでまだ処理中のセッションは維持されます。0 で無効になります。",
         "session_timeout": "セッションタイムアウト",
         "subagent_settings": "サブエージェント設定",
         "takes_effect_on_next_session_range_60_86400s": "次のセッションで有効になります。範囲: 60〜86400秒。",

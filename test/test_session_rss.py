@@ -265,8 +265,12 @@ class TestRssThresholdCheck:
         stub only takes effect on the /proc branch, so a Windows host would
         otherwise measure real trees here and every one of them would read as
         under-threshold. The Windows dispatch has its own test above.
+
+        The tree-CPU reading is pinned to "unreadable" too, so these tests keep
+        the one-tick rule they assert; ``TestRssBusyTreeGuard`` covers the guard.
         """
         monkeypatch.setattr(session.platform_compat, "IS_WINDOWS", False)
+        monkeypatch.setattr(session, "_cpu_ns_from_tree", lambda pid, child_map: None)
 
     def test_shipped_default_reaches_the_enforcement_point(self) -> None:
         """The ceiling is on by default: a manager built from the shipped
@@ -670,3 +674,189 @@ class TestResetGuards:
         recycled = await manager.reset("dashboard:x", skip_if_busy=True)
         assert recycled is False
         assert manager._sessions.get("dashboard:x") is busy  # untouched
+
+
+class TestRssBusyTreeGuard:
+    """An over-ceiling tree that is still using CPU is not recycled.
+
+    A backend can keep working after Crew's turn returns -- Claude Code runs
+    ultracode workflows in the background inside its own process -- so a free
+    semaphore and an empty sub-agent probe do not prove the tree is idle.
+    """
+
+    @pytest.fixture(autouse=True)
+    def _on_the_proc_route(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setattr(session.platform_compat, "IS_WINDOWS", False)
+
+    def _manager(self):
+        manager = _make_manager(rss_max_mb=1000)
+        manager._sessions["dashboard:x"] = _session_stub(busy=False)
+        manager.reset = AsyncMock(return_value=True)
+        manager.get_pid = MagicMock(return_value=4242)
+        return manager
+
+    async def _tick(self, manager, cpu_ns):
+        with (
+            patch("kiro_crew.session._build_child_map", return_value={}),
+            patch("kiro_crew.session._rss_mb_from_tree", return_value=2048),
+            patch("kiro_crew.session._cpu_ns_from_tree", return_value=cpu_ns),
+        ):
+            await manager._rss_threshold_check()
+
+    @pytest.mark.asyncio
+    async def test_first_sight_waits_one_tick_then_an_idle_tree_is_recycled(self) -> None:
+        manager = self._manager()
+        await self._tick(manager, 5_000_000_000)
+        manager.reset.assert_not_awaited()
+        # Age the baseline: back-to-back ticks can read the same monotonic
+        # value on Windows (~15 ms resolution), and no elapsed time is busy.
+        state = manager._cleanup_boundary().state
+        stamp, cpu = state.rss_cpu_samples[4242]
+        state.rss_cpu_samples[4242] = (stamp - 60.0, cpu)
+        await self._tick(manager, 5_000_000_000)
+        manager.reset.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_a_tree_still_using_cpu_is_kept(self) -> None:
+        manager = self._manager()
+        await self._tick(manager, 5_000_000_000)
+        state = manager._cleanup_boundary().state
+        stamp, cpu = state.rss_cpu_samples[4242]
+        # 60 s ago at the same CPU total; 6 s of CPU since = 10% of a core.
+        state.rss_cpu_samples[4242] = (stamp - 60.0, cpu)
+        await self._tick(manager, 11_000_000_000)
+        manager.reset.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_a_cpu_drop_counts_as_activity(self) -> None:
+        """A busy child exiting takes its CPU out of the sum: still activity."""
+        manager = self._manager()
+        await self._tick(manager, 9_000_000_000)
+        state = manager._cleanup_boundary().state
+        stamp, cpu = state.rss_cpu_samples[4242]
+        state.rss_cpu_samples[4242] = (stamp - 60.0, cpu)
+        await self._tick(manager, 1_000_000_000)
+        manager.reset.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_trickle_below_the_idle_floor_is_recycled(self) -> None:
+        manager = self._manager()
+        await self._tick(manager, 5_000_000_000)
+        state = manager._cleanup_boundary().state
+        stamp, cpu = state.rss_cpu_samples[4242]
+        state.rss_cpu_samples[4242] = (stamp - 60.0, cpu)
+        # 0.3 s over 60 s = 0.5% of a core: an idle CLI's background ticking.
+        await self._tick(manager, 5_300_000_000)
+        manager.reset.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_unreadable_cpu_keeps_the_old_one_tick_rule(self) -> None:
+        manager = self._manager()
+        await self._tick(manager, None)
+        manager.reset.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_samples_are_dropped_once_a_tree_is_under_the_ceiling(self) -> None:
+        manager = self._manager()
+        await self._tick(manager, 5_000_000_000)
+        assert 4242 in manager._cleanup_boundary().state.rss_cpu_samples
+        with (
+            patch("kiro_crew.session._build_child_map", return_value={}),
+            patch("kiro_crew.session._rss_mb_from_tree", return_value=10),
+        ):
+            await manager._rss_threshold_check()
+        assert manager._cleanup_boundary().state.rss_cpu_samples == {}
+
+    @pytest.mark.asyncio
+    async def test_disabling_the_watchdog_drops_the_baseline(self) -> None:
+        """A baseline kept while disabled would average new work over the gap."""
+        manager = self._manager()
+        await self._tick(manager, 5_000_000_000)
+        state = manager._cleanup_boundary().state
+        assert 4242 in state.rss_cpu_samples
+        state.rss_max_mb = 0
+        await manager._rss_threshold_check()
+        assert state.rss_cpu_samples == {}
+        state.rss_max_mb = 1000
+        await self._tick(manager, 5_000_000_000)
+        manager.reset.assert_not_awaited()
+
+
+class TestCpuNsFromTree:
+    def test_sums_root_and_descendants(self) -> None:
+        cpu = {100: 1_000, 200: 20, 300: 3}
+        with (
+            patch.object(session_pid.sys, "platform", "linux"),
+            patch.object(session_pid.os.path, "exists", return_value=True),
+            patch.object(
+                session_pid.platform_compat, "proc_cpu_nanos_for_pid", side_effect=cpu.get
+            ),
+        ):
+            assert session_pid._cpu_ns_from_tree(100, {100: [200], 200: [300]}) == 1_023
+
+    def test_windows_uses_the_validated_tree(self) -> None:
+        """Windows sums the same lineage-validated tree its RSS reading sums."""
+        with (
+            patch.object(session_pid.sys, "platform", "win32"),
+            patch.object(
+                session_pid.platform_compat, "proc_cpu_tree_nanos_for_pid", return_value=777
+            ) as tree,
+        ):
+            assert session_pid._cpu_ns_from_tree(100, {}) == 777
+        tree.assert_called_once_with(100)
+
+    def test_unreadable_root_is_no_reading(self) -> None:
+        with (
+            patch.object(session_pid.sys, "platform", "darwin"),
+            patch.object(session_pid.platform_compat, "proc_cpu_nanos_for_pid", return_value=None),
+        ):
+            assert session_pid._cpu_ns_from_tree(100, {}) is None
+
+    def test_missing_linux_root_is_no_reading(self) -> None:
+        """Linux reads 0 for a missing pid; that must not look like an idle tree."""
+        with (
+            patch.object(session_pid.sys, "platform", "linux"),
+            patch.object(session_pid.platform_compat, "proc_cpu_nanos_for_pid", return_value=0),
+            patch.object(session_pid.os.path, "exists", return_value=False),
+        ):
+            assert session_pid._cpu_ns_from_tree(100, {}) is None
+
+
+class TestWindowsCpuTree:
+    """``proc_cpu_tree_nanos_for_pid`` sums the validated tree the RSS reading sums."""
+
+    def _patches(self, pc, descendants):
+        cpu = {100: 1_000, 200: 20, 300: 3}
+        return (
+            patch.object(pc, "IS_WINDOWS", True),
+            patch.object(pc, "proc_cpu_nanos_for_pid", side_effect=cpu.get),
+            patch.object(pc, "_open_process_termination_handle", return_value=9),
+            patch.object(pc, "_windows_process_handle_identity", return_value=(100, 1)),
+            patch.object(pc, "descendant_termination_handles", return_value=descendants),
+            patch.object(pc, "close_process_handle"),
+        )
+
+    def test_sums_root_and_validated_descendants_and_closes_handles(self) -> None:
+        pc = session_pid.platform_compat
+        a, b, c, d, e, closer = self._patches(pc, {200: 7, 300: 8})
+        with a, b, c, d, e, closer as close:
+            assert pc.proc_cpu_tree_nanos_for_pid(100) == 1_023
+        assert sorted(call.args[0] for call in close.call_args_list) == [7, 8, 9]
+
+    def test_failed_enumeration_reads_the_root_alone(self) -> None:
+        pc = session_pid.platform_compat
+        a, b, c, d, _e, closer = self._patches(pc, {})
+        with (
+            a,
+            b,
+            c,
+            d,
+            patch.object(pc, "descendant_termination_handles", side_effect=OSError),
+            closer,
+        ):
+            assert pc.proc_cpu_tree_nanos_for_pid(100) == 1_000
+
+    def test_off_windows_is_no_reading(self) -> None:
+        pc = session_pid.platform_compat
+        with patch.object(pc, "IS_WINDOWS", False):
+            assert pc.proc_cpu_tree_nanos_for_pid(100) is None

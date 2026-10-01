@@ -65,6 +65,8 @@ from kiro_crew.config.sections import (
     FOLDER_SORT_MODES,
     JUDGE_PROVIDERS,
     STT_LANGUAGE_AUTO,
+    WATCHDOG_RSS_MAX_MB_MAX,
+    WATCHDOG_RSS_MAX_MB_MIN,
 )
 from kiro_crew.context_management import RESULT_FILE_MAX_BYTES
 from kiro_crew.dashboard.chat_utils import drained_to_thread
@@ -2633,6 +2635,13 @@ _EDITABLE_CONFIG: dict[str, dict] = {
     "session.pool_size": {"type": "int", "min": 0, "max": 10},
     "session.pool_agent": {"type": "str", "values_fn": _agent_values},
     "session.pool_ttl_secs": {"type": "int", "min": POOL_TTL_SECS_MIN, "max": POOL_TTL_SECS_MAX},
+    # The idle-session memory ceiling. 0 switches the watchdog off. It grants no
+    # capability: it only bounds when Crew recycles an idle session's process.
+    "session.watchdog_rss_max_mb": {
+        "type": "int",
+        "min": WATCHDOG_RSS_MAX_MB_MIN,
+        "max": WATCHDOG_RSS_MAX_MB_MAX,
+    },
     # Intent-level session summaries in the chat right panel. Only the boolean
     # enable is editable here: it spends tokens on turns the user did not ask to
     # pay for, so it is off by default and the Settings toggle is the single

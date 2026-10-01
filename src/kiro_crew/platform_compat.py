@@ -9704,6 +9704,38 @@ def proc_rss_tree_mb_for_pid(pid: int) -> float | None:
         close_process_handle(root_handle)
 
 
+def proc_cpu_tree_nanos_for_pid(pid: int) -> int | None:
+    """Total CPU time (ns) of *pid* and its LINEAGE-VALIDATED Windows descendants.
+
+    Windows-only; None elsewhere. The CPU twin of :func:`proc_rss_tree_mb_for_pid`:
+    it sums the same validated descendant set, so the RSS watchdog's memory and
+    CPU readings describe one process set. None when the root's own counter is
+    unreadable -- no evidence either way.
+    """
+    if not IS_WINDOWS or type(pid) is not int or pid <= 1:
+        return None
+    root_cpu = proc_cpu_nanos_for_pid(pid)
+    if root_cpu is None:
+        return None
+    root_handle = _open_process_termination_handle(pid)
+    if root_handle is None:
+        return root_cpu
+    descendants: dict[int, int] = {}
+    try:
+        identity = _windows_process_handle_identity(root_handle)
+        if identity is None or identity[0] != pid:
+            return root_cpu
+        try:
+            descendants = descendant_termination_handles(pid, root_handle=root_handle)
+        except Exception:
+            descendants = {}
+        return root_cpu + sum(proc_cpu_nanos_for_pid(child) or 0 for child in descendants)
+    finally:
+        for handle in descendants.values():
+            close_process_handle(handle)
+        close_process_handle(root_handle)
+
+
 def proc_cpu_seconds() -> float:
     """Return total (user+system) CPU seconds consumed by this process, or 0.0.
 

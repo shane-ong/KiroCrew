@@ -13308,6 +13308,8 @@
         "save": "Salva",
         "saved": "Salvato",
         "saving": "Salvataggio…",
+        "session_memory_limit": "Limite di memoria delle sessioni inattive",
+        "session_memory_limit_hint": "Riavvia una sessione inattiva quando i suoi processi usano più memoria di questo valore. Una sessione ancora al lavoro in background viene mantenuta. 0 lo disattiva.",
         "session_timeout": "Timeout della sessione",
         "subagent_settings": "Impostazioni dei subagenti",
         "takes_effect_on_next_session_range_60_86400s": "Ha effetto dalla prossima sessione. Intervallo: 60–86400 s.",

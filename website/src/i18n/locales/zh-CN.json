@@ -12932,6 +12932,8 @@
         "save": "保存",
         "saved": "已保存",
         "saving": "保存中…",
+        "session_memory_limit": "空闲会话内存上限",
+        "session_memory_limit_hint": "空闲会话的进程占用内存超过此值时会被重启。仍在后台工作的会话会保留。设为 0 即关闭。",
         "session_timeout": "会话超时",
         "subagent_settings": "子代理设置",
         "takes_effect_on_next_session_range_60_86400s": "下次会话生效。范围：60–86400 秒。",

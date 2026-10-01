@@ -5408,6 +5408,38 @@ def _rss_mb_from_tree(
     return (total_pages * _PAGE_SIZE) // (1024 * 1024)
 
 
+def _cpu_ns_from_tree(pid: int, child_map: dict[int, list[int]]) -> int | None:
+    """Total CPU time (ns) of *pid* + its descendant tree, or ``None``.
+
+    The RSS watchdog's "is this tree still working?" reading, over the same
+    process set its RSS reading covers. Linux walks the prebuilt *child_map*
+    ``_rss_mb_from_tree`` walks. Windows has no map, so it sums the
+    lineage-validated tree ``proc_rss_tree_mb_for_pid`` sums. (macOS reads RSS
+    as 0, so the ceiling never reaches this there.) ``None`` means the root's
+    counter is unreadable here -- no evidence either way -- so the caller keeps
+    its old behaviour instead of guessing. On Linux the per-pid counter reads 0
+    for a missing pid, so the root is checked first.
+    """
+    if sys.platform == "win32":
+        return platform_compat.proc_cpu_tree_nanos_for_pid(pid)
+    root = platform_compat.proc_cpu_nanos_for_pid(pid)
+    if root is None or (
+        sys.platform.startswith("linux") and not os.path.exists(f"/proc/{pid}/stat")
+    ):
+        return None
+    total = root
+    seen = {pid}
+    frontier = list(child_map.get(pid, ()))
+    while frontier:
+        current = frontier.pop()
+        if current in seen:
+            continue
+        seen.add(current)
+        total += platform_compat.proc_cpu_nanos_for_pid(current) or 0
+        frontier.extend(child_map.get(current, ()))
+    return total
+
+
 def get_session_rss_mb(
     pid: int,
     exclude_pids: set[int] = frozenset(),  # type: ignore[assignment]

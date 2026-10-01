@@ -128,6 +128,11 @@ def _no_attached_subagents(key: str) -> bool:
     return False
 
 
+def _no_tree_cpu(pid: int, child_map: dict[int, list[int]]) -> int | None:
+    """Default tree-CPU probe: no reading, so the RSS recycle keeps its old rule."""
+    return None
+
+
 def _no_pending_injection(key: str) -> bool:
     """Default injection probe: a manager with no gateway injects nothing."""
     return False
@@ -150,6 +155,10 @@ class CleanupState:
     # at most once per ``PROBE_FAILURE_WARN_INTERVAL_SECS`` across all keys,
     # never once per candidate per tick.
     probe_failure_warned_at: float | None = None
+    # Runtime pid -> (monotonic time, tree CPU ns) from the last RSS tick that
+    # found that tree over the ceiling. The busy-tree guard compares against it;
+    # pruned every tick to the trees still over the ceiling.
+    rss_cpu_samples: dict[int, tuple[float, int]] = field(default_factory=dict)
     stuck_reported: dict[str, float] = field(default_factory=dict)
     last_pycache_gc: float | None = None
     active_dashboard_slots: set[str] | None = None
@@ -245,6 +254,10 @@ class CleanupDeps:
     # and defaults to "nothing injecting" so a manager without a gateway keeps
     # its existing behaviour.
     has_pending_injection: Callable[[str], bool] = _no_pending_injection
+    # Total CPU time (ns) of a runtime's process tree, walked over the tick's
+    # child map, or None when unreadable. Feeds the RSS recycle's busy-tree
+    # guard. Defaults to "no reading" so a manager without it keeps the old rule.
+    tree_cpu_ns: Callable[[int, dict[int, list[int]]], int | None] = _no_tree_cpu
 
 
 class SessionCleanup:
@@ -258,6 +271,14 @@ class SessionCleanup:
     # RSS reap, so it must surface above debug -- but one line per candidate
     # per tick is the noise this bound exists to prevent.
     PROBE_FAILURE_WARN_INTERVAL_SECS = 3600.0
+
+    # Share of one core a session's process tree may use between two RSS ticks
+    # and still count as idle. A free semaphore only proves Crew's own turn is
+    # over: a backend can keep working on its own after the turn returns (Claude
+    # Code runs ultracode workflows in the background, inside its own process),
+    # and no Crew probe can see that work. An idle CLI sits near 0% of a core,
+    # so a tree above this is treated as working and is not recycled this tick.
+    RSS_BUSY_CPU_FRACTION = 0.02
 
     # Floor between two WARNING lines about a reconcile pass that refuses. A
     # refusal disables both reclamation directions and stops the liveness SLI
@@ -688,6 +709,9 @@ class SessionCleanup:
 
     async def _rss_threshold_check(self) -> None:
         if not self.state.rss_max_mb:
+            # A baseline kept across a disabled stretch would average new work
+            # over the whole gap and read it as idle once re-enabled.
+            self.state.rss_cpu_samples.clear()
             return
 
         candidates: list[tuple[str, int, SessionEntry]] = []
@@ -704,8 +728,9 @@ class SessionCleanup:
                     candidates.append((key, pid, session))
 
         victims: list[tuple[str, int, int, SessionEntry]] = []
+        child_map: dict[int, list[int]] = {}
+        loop = asyncio.get_running_loop()
         if candidates:
-            loop = asyncio.get_running_loop()
             measure: Callable[[int], int]
             if self._deps.is_windows():
 
@@ -739,6 +764,35 @@ class SessionCleanup:
                     rss_by_pid[pid] = rss
                 if rss > self.state.rss_max_mb:
                     victims.append((key, pid, rss, session))
+
+        # Busy-tree guard. A tree still burning CPU is doing work Crew cannot
+        # see (a backend's own background agents), and recycling it kills that
+        # work. A tree is recycled only once two ticks in a row show it idle.
+        over = {pid for _key, pid, _rss, _session in victims}
+        busy: set[int] = set()
+        for pid in over:
+            cpu_ns = await loop.run_in_executor(
+                self._deps.get_maintenance_executor(),
+                self._deps.tree_cpu_ns,
+                pid,
+                child_map,
+            )
+            if self._tree_is_busy(pid, cpu_ns):
+                busy.add(pid)
+        self.state.rss_cpu_samples = {
+            pid: sample for pid, sample in self.state.rss_cpu_samples.items() if pid in over
+        }
+        if busy:
+            for key, pid, rss, _session in victims:
+                if pid in busy:
+                    self._deps.logger.info(
+                        "RSS recycle: session %s tree rss=%dMB exceeds %dMB "
+                        "but its tree is still using CPU; skipping",
+                        key,
+                        rss,
+                        self.state.rss_max_mb,
+                    )
+            victims = [victim for victim in victims if victim[1] not in busy]
 
         # One RECLAIM per runtime per tick. The threshold was crossed by a
         # process, and every session on it reads the same figure, so recycling
@@ -816,6 +870,27 @@ class SessionCleanup:
             except Exception:
                 # One victim cannot suppress the rest of this tick.
                 self._deps.logger.exception("RSS recycle failed for session %s", key)
+
+    def _tree_is_busy(self, pid: int, cpu_ns: int | None) -> bool:
+        """Whether *pid*'s tree used CPU since the last tick that measured it.
+
+        ``None`` is no reading, so the old rule applies (not busy). A tree seen
+        for the first time has no baseline yet, so it is held one tick; the
+        same holds after a clock or pid change. A drop counts as activity too:
+        a busy child exiting takes its CPU time out of the sum.
+        """
+        if cpu_ns is None:
+            self.state.rss_cpu_samples.pop(pid, None)
+            return False
+        now = self._deps.monotonic()
+        previous = self.state.rss_cpu_samples.get(pid)
+        self.state.rss_cpu_samples[pid] = (now, cpu_ns)
+        if previous is None:
+            return True
+        elapsed_ns = (now - previous[0]) * 1_000_000_000
+        if elapsed_ns <= 0:
+            return True
+        return abs(cpu_ns - previous[1]) >= self.RSS_BUSY_CPU_FRACTION * elapsed_ns
 
     def _injection_pending(self, key: str) -> bool:
         """Fail-closed read of "is a completion injection in flight for *key*?".

@@ -13308,6 +13308,8 @@
         "save": "Guardar",
         "saved": "Guardado",
         "saving": "Guardando…",
+        "session_memory_limit": "Límite de memoria de la sesión inactiva",
+        "session_memory_limit_hint": "Reinicia una sesión inactiva cuando sus procesos usan más memoria que este valor. Una sesión que aún trabaja en segundo plano se conserva. 0 lo desactiva.",
         "session_timeout": "Tiempo de espera de la sesión",
         "subagent_settings": "Ajustes de subagentes",
         "takes_effect_on_next_session_range_60_86400s": "Se aplica en la próxima sesión. Intervalo: 60–86400s.",

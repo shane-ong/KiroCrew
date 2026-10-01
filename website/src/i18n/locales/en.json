@@ -7746,6 +7746,8 @@
         "provider": "Provider",
         "sandbox": "Sandbox",
         "saved": "Saved",
+        "session_memory_limit": "Idle Session Memory Limit",
+        "session_memory_limit_hint": "Restart an idle session when its processes use more memory than this. A session still working in the background is kept. 0 turns this off.",
         "session_timeout": "Session Timeout",
         "subagent_settings": "Subagent Settings",
         "takes_effect_on_next_session_range_60_86400s": "Takes effect on next session. Range: 60–86400s.",

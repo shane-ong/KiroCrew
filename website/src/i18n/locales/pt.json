@@ -13308,6 +13308,8 @@
         "save": "Salvar",
         "saved": "Salvo",
         "saving": "Salvando…",
+        "session_memory_limit": "Limite de memória da sessão ociosa",
+        "session_memory_limit_hint": "Reinicia uma sessão ociosa quando seus processos usam mais memória do que este valor. Uma sessão que ainda trabalha em segundo plano é mantida. 0 desativa isso.",
         "session_timeout": "Tempo limite da sessão",
         "subagent_settings": "Configurações de subagentes",
         "takes_effect_on_next_session_range_60_86400s": "Aplica-se na próxima sessão. Faixa: 60–86400s.",
