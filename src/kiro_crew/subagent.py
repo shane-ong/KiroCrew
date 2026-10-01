@@ -1448,6 +1448,23 @@ def _timeout_context(
     return " | ".join(parts)
 
 
+#: Cause recorded when a finite cgroup memory limit is set but that level's
+#: usage file cannot be read: the headroom is unknown, not measured as low.
+MEMORY_CAUSE_CGROUP_USAGE_UNREADABLE = "cgroup_usage_unreadable"
+
+#: Set by :func:`check_memory_available` (via the cgroup probe it runs) and read
+#: once by the spawn gate with :func:`pop_memory_check_cause`. Diagnostic only:
+#: the admission verdict never depends on it.
+_memory_check_cause = ""
+
+
+def pop_memory_check_cause() -> str:
+    """Return the last memory check's cause ("" for a plain reading) and clear it."""
+    global _memory_check_cause
+    cause, _memory_check_cause = _memory_check_cause, ""
+    return cause
+
+
 def check_memory_available(
     min_gb: float = 4.0, *, path: str = "/proc/meminfo"
 ) -> tuple[bool, float]:
@@ -1489,6 +1506,7 @@ def check_memory_available(
         # A failed host read cannot discard a known container constraint.
         pass
     if path == "/proc/meminfo":
+        pop_memory_check_cause()  # the cgroup probe below records a fresh one
         cgroup_gb = _cgroup_available_gb()
         if cgroup_gb >= 0:
             avail = cgroup_gb if avail < 0 else min(avail, cgroup_gb)
@@ -1861,8 +1879,11 @@ def _container_cgroup_available_gb() -> float:
     SAME level, including siblings charged to a parent. A finite limit with
     unknown usage contributes zero headroom, never zero usage. Ancestors
     hidden above a mount cannot be measured. Usage excludes the level's
-    inactive page cache (:func:`_read_inactive_file_bytes`).
+    inactive page cache (:func:`_read_inactive_file_bytes`). An unknown usage
+    records :data:`MEMORY_CAUSE_CGROUP_USAGE_UNREADABLE` so a deferral can say
+    the headroom is unknown rather than exhausted.
     """
+    global _memory_check_cause
     available = -1.0
     for leaf, mount, v2 in _cgroup_memory_roots():
         limit_name = "memory.max" if v2 else "memory.limit_in_bytes"
@@ -1879,11 +1900,13 @@ def _container_cgroup_available_gb() -> float:
                 current = _read_int_file(str(directory / usage_name))
                 if limit is not None and 0 <= limit < _CGROUP_UNLIMITED:
                     # No spare capacity is established when usage is unknown.
-                    headroom = (
-                        max(0.0, (limit - _working_set(directory, v2, current)) / (1024**3))
-                        if current is not None and current >= 0
-                        else 0.0
-                    )
+                    if current is not None and current >= 0:
+                        headroom = max(
+                            0.0, (limit - _working_set(directory, v2, current)) / (1024**3)
+                        )
+                    else:
+                        headroom = 0.0
+                        _memory_check_cause = MEMORY_CAUSE_CGROUP_USAGE_UNREADABLE
                     available = headroom if available < 0 else min(available, headroom)
             if directory == mount:
                 break
@@ -3296,7 +3319,7 @@ class SubagentManager:
         # a queued silent spawn emit output. See _drain_queue.
         self._queue: list[dict[str, Any]] = []
         # parent_session_key -> the last wait the gate labelled for that parent
-        # (``{"reason": <QUEUED_REASON_*>, "available_gb"?, "required_gb"?}``).
+        # (``{"reason": <QUEUED_REASON_*>, "available_gb"?, "required_gb"?, "cause"?}``).
         # ``_emit_queue_depth`` attaches it to every ``subagent_queued`` it sends
         # while the parent still has rows waiting, and forgets it at depth 0: the
         # drain and the cancel paths re-emit the depth without a verdict of their
